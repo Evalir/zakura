@@ -438,7 +438,10 @@ impl StateService {
                     .unwrap_or_else(|error| match error {
                         // This database cannot be repaired, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
-                        error @ StateInitError::VctSproutHistoryUnrepairable => {
+                        error @ (StateInitError::VctSproutHistoryUnrepairable
+                        | StateInitError::TransparentIndexesMissingInArchiveMode {
+                            ..
+                        }) => {
                             panic!("{error}")
                         }
                         error => panic!(
@@ -3038,7 +3041,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
-                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
+                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend)?,
             )),
 
             ReadRequest::CheckParentInputs { parent, outpoints } => {
