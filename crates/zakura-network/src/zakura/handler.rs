@@ -598,6 +598,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// State-backed source for bounded native GetBlocks serving.
+    pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
@@ -1888,6 +1890,14 @@ impl ServiceSessionState {
         self.local_session_id.is_some() || self.remote_session_id.is_some()
     }
 
+    /// Whether a peer-opened stream must be dropped before reserving capacity:
+    /// a remote session still owns its slot, or this side wins the collision
+    /// with its own session.
+    fn rejects_remote_offer(&self, i_open_collision_winner: bool) -> bool {
+        self.remote_session_id.is_some()
+            || (i_open_collision_winner && self.local_session_id.is_some())
+    }
+
     fn remove_active_session(&mut self, opened_locally: bool, session_id: u64) -> bool {
         let active_session = if opened_locally {
             &mut self.local_session_id
@@ -2634,7 +2644,8 @@ impl ZakuraProtocolHandler {
             close_cause.record("resource_ordered_streams");
             connection_token.cancel();
         } else if !negotiated_ordered_streams.is_empty()
-            && usize::from(limits.max_inbound_queue_depth) < negotiated_ordered_streams.len()
+            && usize::from(limits.max_inbound_queue_depth)
+                < minimum_ordered_queue_capacity(&negotiated_ordered_streams)
         {
             debug!(
                 max_inbound_queue_depth = limits.max_inbound_queue_depth,
@@ -2902,12 +2913,12 @@ impl ZakuraProtocolHandler {
                 }, if incoming_setup.is_some() => {
                     incoming_setup = None;
                     let Some(setup) = setup else { continue; };
-                    // Active and retiring remote sessions still own their slot.
-                    // Reject duplicates before reserving capacity for any member.
                     if setup.session.as_ref().is_some_and(|(layout, _)| {
                         service_sessions
                             .get(&layout.primary().kind)
-                            .is_some_and(|session| session.remote_session_id.is_some())
+                            .is_some_and(|session| {
+                                session.rejects_remote_offer(context.i_open_collision_winner)
+                            })
                     }) {
                         continue;
                     }
@@ -3533,8 +3544,12 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
             return Ok(());
         }
-        if ordered_stream_count > 0
-            && usize::from(context.limits.max_inbound_queue_depth) < ordered_stream_count
+        if usize::from(context.limits.max_inbound_queue_depth)
+            < minimum_ordered_queue_capacity(
+                &self
+                    .registry
+                    .persistent_streams_for_negotiated(context.accepted_capabilities),
+            )
         {
             debug!(
                 max_inbound_queue_depth = context.limits.max_inbound_queue_depth,
@@ -4042,7 +4057,8 @@ async fn spawn_zakura_endpoint_inner(
                 best_header_tip,
                 driver_startup.committed_views.clone(),
                 config.zakura.block_sync.clone(),
-            );
+            )
+            .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
@@ -5918,6 +5934,20 @@ fn inbound_frame_cap_for_stream(limits: &ZakuraConnectionLimits, stream: Stream)
         .min(limits.max_message_bytes.saturating_add(frame_header_bytes))
 }
 
+fn minimum_ordered_queue_capacity(streams: &[Stream]) -> usize {
+    // Regulation needs independent room for a response and requests/control.
+    // Layouts without block sync keep one slot per stream.
+    let slots = if streams
+        .iter()
+        .any(|stream| stream.kind == crate::zakura::ZAKURA_STREAM_BLOCK_SYNC)
+    {
+        2
+    } else {
+        1
+    };
+    streams.len().saturating_mul(slots)
+}
+
 fn per_stream_inbound_queue_depth(
     max_inbound_queue_depth: u16,
     ordered_stream_count: usize,
@@ -6209,9 +6239,9 @@ mod tests {
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits,
             LOCAL_MAX_CONTROL_FRAME_BYTES, LOCAL_MAX_MESSAGE_BYTES, MAX_BS_FRAME_BYTES,
-            MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            MAX_HS_MESSAGE_BYTES, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -8419,9 +8449,9 @@ mod tests {
         let exit = SessionExit {
             stream: Stream {
                 kind: ZAKURA_STREAM_BLOCK_SYNC,
-                version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
                 frame_cap: 1,
-                capability: ZAKURA_CAP_BLOCK_SYNC,
+                capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ..Stream::PERSISTENT
             },
             session_id: 1,
@@ -8466,6 +8496,24 @@ mod tests {
         assert_eq!(session.remote_session_id, Some(2));
         assert!(session.remove_active_session(false, 2));
         assert_eq!(session.remote_session_id, None);
+    }
+
+    #[test]
+    fn losing_or_duplicate_remote_offers_are_rejected_before_reservation() {
+        let mut session = ServiceSessionState::new(test_ordered_stream());
+        assert!(!session.rejects_remote_offer(true));
+        session.local_session_id = Some(1);
+        assert!(
+            session.rejects_remote_offer(true),
+            "the collision winner keeps its own session"
+        );
+        assert!(
+            !session.rejects_remote_offer(false),
+            "the collision loser adopts the peer's stream"
+        );
+        session.local_session_id = None;
+        session.remote_session_id = Some(2);
+        assert!(session.rejects_remote_offer(false));
     }
 
     fn test_ordered_stream() -> Stream {
@@ -8712,9 +8760,9 @@ mod tests {
         let limits = test_connection_limits();
         let stream = Stream {
             kind: ZAKURA_STREAM_BLOCK_SYNC,
-            version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
             frame_cap: 2_000_009,
-            capability: ZAKURA_CAP_BLOCK_SYNC,
+            capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ..Stream::PERSISTENT
         };
         let encoded = frame.encode(stream.frame_cap)?;
@@ -8929,7 +8977,7 @@ mod tests {
             kind: stream_kind,
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: 2_000_009,
-            capability: ZAKURA_CAP_BLOCK_SYNC,
+            capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ..Stream::PERSISTENT
         };
         let context = StreamWorkerContext {
@@ -10394,6 +10442,19 @@ mod tests {
     }
 
     #[test]
+    fn block_sync_needs_two_slots_per_ordered_stream() {
+        let block_sync = crate::zakura::block_sync_streams()[0];
+        let other = Stream {
+            kind: 5,
+            messages: None,
+            ..block_sync
+        };
+        assert_eq!(minimum_ordered_queue_capacity(&[other]), 1);
+        assert_eq!(minimum_ordered_queue_capacity(&[block_sync]), 2);
+        assert_eq!(minimum_ordered_queue_capacity(&[block_sync, other]), 4);
+    }
+
+    #[test]
     fn token_bucket_rejects_churn_until_refill() {
         let clock = crate::zakura::testkit::TestClock::new();
         let mut bucket = TokenBucket::with_clock(2, clock.clone());
@@ -10443,7 +10504,7 @@ mod tests {
                 kind: ZAKURA_STREAM_BLOCK_SYNC,
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: MAX_BS_FRAME_BYTES,
-                capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
+                capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ..Stream::PERSISTENT
             },
         ];
