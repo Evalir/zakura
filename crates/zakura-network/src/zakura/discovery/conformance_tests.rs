@@ -117,6 +117,10 @@ impl StreamConformance for DiscoveryConformance {
     fn page(_row: &MessageRule, _key: u32, _cursor: u32) -> DiscoveryMessage {
         unreachable!("discovery has no subscription row")
     }
+
+    fn read_page(_message: &DiscoveryMessage) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 stream_conformance_suite!(
