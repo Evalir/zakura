@@ -20,9 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     protocol::{
-        DiscoveryMessage, GetPeers, MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS,
+        DiscoveryMessage, GetPeers, GetServices, MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
     },
-    wire::{peers_cap, GET_PEERS},
+    wire::{peers_cap, services_cap, GET_PEERS, GET_SERVICES, LARGEST_PEERS, LARGEST_SERVICES},
 };
 use crate::zakura::{
     regulation::{
@@ -37,16 +37,18 @@ use crate::zakura::{
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 enum QueryKind {
     Peers,
+    Services,
 }
 
 /// Every query kind. A session holds at most one live query of each.
-const QUERY_KINDS: [QueryKind; 1] = [QueryKind::Peers];
+const QUERY_KINDS: [QueryKind; 2] = [QueryKind::Peers, QueryKind::Services];
 
 impl QueryKind {
     /// The kind that a `message_type` frame answers, if it answers a query.
     fn answered_by(message_type: u16) -> Option<Self> {
         match u8::try_from(message_type) {
             Ok(MSG_DISCOVERY_PEERS) => Some(Self::Peers),
+            Ok(MSG_DISCOVERY_SERVICES) => Some(Self::Services),
             _ => None,
         }
     }
@@ -57,18 +59,22 @@ impl QueryKind {
 pub(super) enum Asked {
     /// A `GetPeers` with this limit.
     Peers { limit: u16 },
+    /// A `GetServices`, whose wanted list bounds the answer's summaries.
+    Services(GetServices),
 }
 
 impl Asked {
     fn kind(&self) -> QueryKind {
         match self {
             Self::Peers { .. } => QueryKind::Peers,
+            Self::Services(_) => QueryKind::Services,
         }
     }
 
     fn request_type(&self) -> u16 {
         match self {
             Self::Peers { .. } => GET_PEERS.message_type,
+            Self::Services(_) => GET_SERVICES.message_type,
         }
     }
 
@@ -77,16 +83,27 @@ impl Asked {
     fn cap(&self) -> ResponseCap {
         match self {
             Self::Peers { limit } => peers_cap(*limit),
+            Self::Services(query) => services_cap(query.wanted_services.len()),
         }
     }
 
-    /// Checks a decoded answer against what the query asked.
+    /// Checks a decoded answer against what the query asked. The decoder
+    /// already checked that summaries are unique, so a wanted list also
+    /// bounds their count.
     pub(super) fn check(&self, answer: &DiscoveryMessage) -> Result<(), &'static str> {
         match (self, answer) {
             (Self::Peers { limit }, DiscoveryMessage::Peers { records })
                 if records.len() > usize::from(*limit) =>
             {
                 Err("Zakura discovery PEERS carries more records than its GetPeers limit")
+            }
+            (Self::Services(query), DiscoveryMessage::Services(services))
+                if !services
+                    .summaries
+                    .iter()
+                    .all(|summary| query.wants(&summary.service_id)) =>
+            {
+                Err("Zakura discovery SERVICES carries a summary its GetServices did not ask for")
             }
             _ => Ok(()),
         }
@@ -95,14 +112,13 @@ impl Asked {
 
 /// The node-wide pool of discovery reservations.
 ///
-/// It holds enough `GetPeers` reservations to keep twice the bandwidth-delay
-/// product reserved, so it never limits a node that keeps its sessions within
-/// the peer limits.
+/// It holds enough entries for sessions that each reserve the largest `Peers`
+/// and the largest `Services` to keep twice the bandwidth-delay product
+/// reserved, so it never limits a node that keeps its sessions within the
+/// peer limits.
 pub(super) fn reservation_pool() -> ReservationPool {
-    let largest = peers_cap(
-        u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE).expect("the largest limit fits u16"),
-    );
-    ReservationPool::new(sizing::reservation_entries(largest.output_bytes()))
+    let session_bytes = LARGEST_PEERS.output_bytes() + LARGEST_SERVICES.output_bytes();
+    ReservationPool::new(QUERY_KINDS.len() * sizing::reservation_entries(session_bytes))
         .expect("the derived pool size is nonzero and far below the semaphore maximum")
 }
 
@@ -182,6 +198,12 @@ impl Queries {
             .await
     }
 
+    /// Reserves the answer to `query`, then sends it.
+    pub(super) async fn send_get_services(&self, query: GetServices) -> Result<(), QueryUnsent> {
+        let message = DiscoveryMessage::GetServices(query.clone());
+        self.send_query(Asked::Services(query), &message).await
+    }
+
     /// Reserves the answer to `message`, which asks `asked`, then sends it.
     /// A query that is never written gives its reservation back.
     ///
@@ -232,7 +254,7 @@ impl Queries {
         };
         let mut live = self.lock();
         if self.transport_admits {
-            live.reservations.take_admitted(payload_len);
+            live.reservations.take_admitted(message_type, payload_len);
         }
         live.reservations
             .claim_end(&kind, message_type, payload_len)?;
@@ -273,10 +295,6 @@ struct QueriesPrecheck(Arc<Mutex<LiveQueries>>);
 
 impl ResponsePrecheck for QueriesPrecheck {
     fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
-        // An answer to no query keeps its row checks alone.
-        if QueryKind::answered_by(message_type).is_none() {
-            return Ok(());
-        }
         lock(&self.0)
             .reservations
             .admit(message_type, payload_len)
@@ -288,6 +306,9 @@ impl ResponsePrecheck for QueriesPrecheck {
 mod tests {
     use super::*;
     use crate::zakura::{
+        discovery::protocol::{
+            DiscoveryServiceSummary, ServiceSummaryEnvelope, Services, ZakuraServiceId,
+        },
         framed_channel,
         regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
         CloseCause,
@@ -384,8 +405,166 @@ mod tests {
         assert_eq!(queries.claim(GET_PEERS.message_type, 2), Ok(None));
     }
 
-    /// The transport reader queues at most the one `Peers` this node is owed.
-    /// Its claim releases the queued answer.
+    fn get_services(wanted_services: Vec<ZakuraServiceId>) -> GetServices {
+        GetServices { wanted_services }
+    }
+
+    /// The payload length of a `Services` with the most summaries that a
+    /// `GetServices` wanting `wanted_len` services allows.
+    fn services_len(wanted_len: usize) -> usize {
+        usize::try_from(services_cap(wanted_len).bytes).expect("a small cap fits usize")
+    }
+
+    const SERVICES: u16 = MSG_DISCOVERY_SERVICES as u16;
+
+    /// A `GetServices` reservation is independent of the `GetPeers` one. Its
+    /// answer claims it once, returns the query, and stays within
+    /// `42 + min(n, 8) × 294` bytes.
+    #[tokio::test]
+    async fn get_services_is_reserved_beside_get_peers_and_claimed_once() {
+        let Session {
+            queries,
+            mut written,
+            ..
+        } = session(&reservation_pool());
+        let wanted = get_services(vec![ZakuraServiceId::discovery()]);
+
+        assert!(matches!(
+            queries.claim(SERVICES, services_len(0)),
+            Err(ClaimRefused::Unsolicited { .. })
+        ));
+        queries
+            .send_get_peers(get_peers(1))
+            .await
+            .expect("GetPeers is sent");
+        queries
+            .send_get_services(wanted.clone())
+            .await
+            .expect("GetServices is sent beside GetPeers");
+        assert!(matches!(
+            queries.send_get_services(get_services(Vec::new())).await,
+            Err(QueryUnsent::NotDue)
+        ));
+        written.recv().await.expect("GetPeers was queued");
+        written.recv().await.expect("GetServices was queued");
+
+        assert_eq!(
+            queries.claim(SERVICES, services_len(1)),
+            Ok(Some(Asked::Services(wanted.clone())))
+        );
+        assert!(matches!(
+            queries.claim(SERVICES, services_len(1)),
+            Err(ClaimRefused::Unsolicited { .. })
+        ));
+        assert_eq!(
+            queries.claim(PEERS, peers_len(1)),
+            Ok(Some(Asked::Peers { limit: 1 }))
+        );
+
+        // One wanted service allows one summary, below the row's largest
+        // answer.
+        queries
+            .send_get_services(wanted)
+            .await
+            .expect("an answered query frees its kind");
+        written.recv().await.expect("GetServices was queued");
+        assert!(matches!(
+            queries.claim(SERVICES, services_len(1) + 1),
+            Err(ClaimRefused::OverBytes { .. })
+        ));
+
+        // An empty wanted list reserves the largest answer.
+        queries
+            .send_get_services(get_services(Vec::new()))
+            .await
+            .expect("an answered query frees its kind");
+        written.recv().await.expect("GetServices was queued");
+        assert_eq!(
+            queries.claim(SERVICES, services_len(0)),
+            Ok(Some(Asked::Services(get_services(Vec::new()))))
+        );
+    }
+
+    /// A wanted list bounds the answer's summaries, and an empty list allows
+    /// any service.
+    #[test]
+    fn a_services_answer_holds_only_wanted_summaries() -> Result<(), crate::BoxError> {
+        let summary = ServiceSummaryEnvelope::discovery(&DiscoveryServiceSummary {
+            peer_exchange_slots_free: 1,
+            max_records_per_response: 32,
+            expected_disconnect_after_exchange: false,
+        })?;
+        let services = |summaries| {
+            DiscoveryMessage::Services(Services {
+                node_id: zakura_quic::NodeSecretKey::from_bytes(&[1; 32]).public(),
+                expires_at_unix_secs: u64::MAX,
+                summaries,
+            })
+        };
+        let asked = |wanted| Asked::Services(get_services(wanted));
+
+        let discovery = vec![ZakuraServiceId::discovery()];
+        let header_sync = vec![ZakuraServiceId::header_sync()];
+        assert_eq!(
+            asked(Vec::new()).check(&services(vec![summary.clone()])),
+            Ok(())
+        );
+        assert_eq!(
+            asked(discovery).check(&services(vec![summary.clone()])),
+            Ok(())
+        );
+        assert!(asked(header_sync.clone())
+            .check(&services(vec![summary]))
+            .is_err());
+        assert_eq!(asked(header_sync).check(&services(Vec::new())), Ok(()));
+        Ok(())
+    }
+
+    /// The transport reader queues a `Services` only while a `GetServices`
+    /// is owed, and refuses one above its reservation. A live `GetPeers`
+    /// lends it no credit.
+    #[tokio::test]
+    async fn the_transport_reader_queues_only_owed_services() {
+        let slot = PrecheckSlot::default();
+        let (_send, recv) = framed_channel(1);
+        let recv = recv.with_precheck(slot.clone());
+        let Session {
+            queries,
+            mut written,
+            ..
+        } = session_with(reservation_pool(), &recv);
+        let precheck = slot.get().expect("the queries attach their precheck");
+
+        assert_eq!(
+            precheck.check(SERVICES, services_len(0)),
+            Err(FrameRejection::Unsolicited)
+        );
+        queries
+            .send_get_peers(get_peers(32))
+            .await
+            .expect("GetPeers is sent");
+        queries
+            .send_get_services(get_services(Vec::new()))
+            .await
+            .expect("the query is sent");
+        written.recv().await.expect("GetPeers was queued");
+        written.recv().await.expect("the query was queued");
+        assert!(matches!(
+            precheck.check(SERVICES, services_len(0) + 1),
+            Err(FrameRejection::AboveReservation { .. })
+        ));
+        precheck
+            .check(SERVICES, services_len(0))
+            .expect("the owed answer queues");
+        assert!(matches!(
+            precheck.check(SERVICES, services_len(0)),
+            Err(FrameRejection::AboveOwed { .. })
+        ));
+    }
+
+    /// The transport reader queues at most the one `Peers` this node is owed,
+    /// even while a `GetServices` is owed too. Its claim releases the queued
+    /// answer.
     #[tokio::test]
     async fn the_transport_reader_queues_at_most_the_owed_peers() {
         let slot = PrecheckSlot::default();
@@ -403,9 +582,14 @@ mod tests {
             Err(FrameRejection::Unsolicited)
         );
         queries
+            .send_get_services(get_services(Vec::new()))
+            .await
+            .expect("GetServices is sent");
+        queries
             .send_get_peers(get_peers(1))
             .await
             .expect("the query is sent");
+        written.recv().await.expect("GetServices was queued");
         written.recv().await.expect("the query was queued");
 
         precheck
