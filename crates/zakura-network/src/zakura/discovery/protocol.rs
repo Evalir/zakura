@@ -15,15 +15,16 @@ use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use zakura_chain::{
     block,
+    diagnostic::task::CheckForPanics,
     primitives::ed25519::{Signature, SigningKey},
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
 use crate::zakura::{
-    canonical_ip, BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection,
-    ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
-    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    canonical_ip, regulation::SlotBudget, BlockSyncStatus, ServiceAdmissionDecision,
+    ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId,
+    ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 /// Native discovery stream kind.
@@ -308,12 +309,25 @@ impl ZakuraNodeRecord {
     }
 
     /// Verifies this record signature and advisory import context.
+    ///
+    /// The author's checks run first, so an expired record with a bad
+    /// signature fails as [`DiscoveryRecordError::InvalidSignature`].
     pub fn verify(
         &self,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<(), DiscoveryRecordError> {
-        validate_record_body_for_import(&self.body, context)?;
+        self.verify_authentic(context)?;
+        validate_record_expiry(&self.body, context)
+    }
 
+    /// Verifies what only the record's author controls: bounds, signature,
+    /// network, chain, and protocol overlap. Expiry depends on the local clock,
+    /// so [`validate_record_expiry`] checks it separately.
+    pub(super) fn verify_authentic(
+        &self,
+        context: &DiscoveryRecordValidationContext,
+    ) -> Result<(), DiscoveryRecordError> {
+        validate_record_body_bounds(&self.body)?;
         let body_bytes = self
             .body
             .encode_for_signature()
@@ -324,7 +338,8 @@ impl ZakuraNodeRecord {
         self.body
             .node_id
             .verify_strict(&body_bytes, &self.signature.to_bytes())
-            .map_err(|_| DiscoveryRecordError::InvalidSignature)
+            .map_err(|_| DiscoveryRecordError::InvalidSignature)?;
+        validate_record_context(&self.body, context)
     }
 }
 
@@ -981,6 +996,10 @@ pub enum DiscoveryBookError {
         addr: SocketAddr,
     },
 
+    /// The runtime shut down before the record's verification ran.
+    #[error("Zakura discovery record verification was cancelled")]
+    VerificationCancelled,
+
     /// A record field exceeded a book-specific storage limit.
     #[error("Zakura discovery record {field} count {actual} exceeds book limit {max}")]
     Limit {
@@ -991,6 +1010,42 @@ pub enum DiscoveryBookError {
         /// Maximum accepted count or size.
         max: usize,
     },
+}
+
+/// What a failed record import means for the peer that sent it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum RecordVerdict {
+    /// Local policy or the local clock rejected an authentic record.
+    Drop,
+    /// The peer sent a record no conformant peer sends.
+    Disconnect,
+}
+
+/// The verdict for a failed `Hello` import.
+///
+/// The match names every variant, so a new error fails the build until it is
+/// classified. Expiry depends on the local clock and TTL, and address and
+/// storage policy are local, so those only drop the record.
+pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
+    match error {
+        DiscoveryBookError::Record(error) => match error {
+            DiscoveryRecordError::Wire(_)
+            | DiscoveryRecordError::MalformedNodeId
+            | DiscoveryRecordError::InvalidSignature
+            | DiscoveryRecordError::WrongNetwork
+            | DiscoveryRecordError::WrongChain
+            | DiscoveryRecordError::IncompatibleProtocol => RecordVerdict::Disconnect,
+            DiscoveryRecordError::Expired | DiscoveryRecordError::FarFutureExpiry => {
+                RecordVerdict::Drop
+            }
+        },
+        DiscoveryBookError::MismatchedConnectedPeerRecord => RecordVerdict::Disconnect,
+        DiscoveryBookError::SelfRecord
+        | DiscoveryBookError::NoUsableDirectAddress
+        | DiscoveryBookError::NonDialableDirectAddress { .. }
+        | DiscoveryBookError::Limit { .. }
+        | DiscoveryBookError::VerificationCancelled => RecordVerdict::Drop,
+    }
 }
 
 /// In-memory storage for signed Zakura discovery records.
@@ -1110,6 +1165,18 @@ pub struct ZakuraDiscoveryHandle {
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
     peer_snapshot_tx: watch::Sender<ServicePeerSnapshot>,
     import_validation: DiscoveryImportValidation,
+    /// Node-wide slots for record signature verification. Each session's
+    /// reader verifies one message at a time, so a peer holds at most one slot.
+    verify_slots: SlotBudget,
+}
+
+/// Signature verification slots: a quarter of the cores, and at least one.
+fn record_verify_slots() -> SlotBudget {
+    let slots = std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get() / 4)
+        .max(1);
+    SlotBudget::new(slots)
+        .expect("the slot count is at least one and far below the semaphore maximum")
 }
 
 /// Immutable inputs needed to validate and bound a peer record batch without holding the
@@ -1462,6 +1529,7 @@ impl ZakuraDiscoveryHandle {
             peer_snapshot: peer_snapshot_rx,
             peer_snapshot_tx,
             import_validation,
+            verify_slots: record_verify_slots(),
         })
     }
 
@@ -1863,6 +1931,9 @@ impl ZakuraDiscoveryHandle {
     /// Active service hints come only from the authenticated peer's own signed `Hello`.
     /// Addressless or locally non-dialable records can still update active services, because the
     /// live connection is already established; they are still rejected from dialable storage.
+    ///
+    /// Signature verification runs outside the discovery lock. A record identical to the
+    /// stored one skips it, and policy runs in one short lock hold.
     pub async fn import_connected_peer_record(
         &self,
         record: ZakuraNodeRecord,
@@ -1871,12 +1942,13 @@ impl ZakuraDiscoveryHandle {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
+        let record = self.verify_unless_stored(record).await?;
 
         let now = current_unix_secs();
         let services = normalize_services(record.body.services.clone());
         let mut inner = self.inner.lock().await;
         let context = inner.validation_context(now);
-        record.verify(&context)?;
+        validate_record_expiry(&record.body, &context)?;
         if record.body.services.len() > inner.config.book_limits.max_services_per_record {
             return Err(DiscoveryBookError::Limit {
                 field: "service",
@@ -1888,7 +1960,7 @@ impl ZakuraDiscoveryHandle {
         let import_result =
             inner
                 .book
-                .import_record(record.clone(), Some(peer_node_id), now, &context);
+                .import_verified_record(record.clone(), Some(peer_node_id), now, &context);
         if import_result.is_ok()
             || matches!(import_result, Err(ref error) if is_direct_address_import_error(error))
         {
@@ -1897,9 +1969,46 @@ impl ZakuraDiscoveryHandle {
                 record,
                 services,
                 &import_result,
+                now,
             );
         }
         import_result
+    }
+
+    /// Verifies `record`'s author checks off the lock, unless the record is
+    /// already stored.
+    ///
+    /// A record identical to the one stored for its node, in the book or in the live
+    /// service hints, was verified when it was stored, so it skips verification.
+    async fn verify_unless_stored(
+        &self,
+        record: ZakuraNodeRecord,
+    ) -> Result<ZakuraNodeRecord, DiscoveryBookError> {
+        if self.inner.lock().await.holds_record(&record) {
+            return Ok(record);
+        }
+        self.verify_off_lock(move |context| record.verify_authentic(context).map(|()| record))
+            .await
+            .ok_or(DiscoveryBookError::VerificationCancelled)?
+            .map_err(DiscoveryBookError::Record)
+    }
+
+    /// Runs `verify` in a blocking task under a node-wide verification slot,
+    /// with the validation context for now. Returns `None` if shutdown
+    /// cancelled the task.
+    async fn verify_off_lock<T: Send + 'static>(
+        &self,
+        verify: impl FnOnce(&DiscoveryRecordValidationContext) -> T + Send + 'static,
+    ) -> Option<T> {
+        let slot = self.verify_slots.reserve().await;
+        let context = self.import_validation.context(current_unix_secs());
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            verify(&context)
+        })
+        .await
+        .check_for_panics_with(false)
+        .ok()
     }
 
     /// Imports records loaded from persistent storage through the validation path.
@@ -2437,6 +2546,12 @@ impl ZakuraDiscoveryHandle {
             .map(|entry| entry.live_summaries.clone())
     }
 
+    /// Holds every free verification slot until the returned permits drop.
+    #[cfg(test)]
+    pub(super) fn hold_verify_slots(&self) -> Vec<crate::zakura::regulation::SlotPermit> {
+        self.verify_slots.hold_free()
+    }
+
     /// Returns a stored discovery record for `node_id`, if present.
     pub async fn record_for(&self, node_id: NodeId) -> Option<ZakuraNodeRecord> {
         let inner = self.inner.lock().await;
@@ -2483,18 +2598,33 @@ impl ZakuraDiscoveryInner {
         self.last_connected_node_ids = connected_node_ids;
     }
 
+    /// Whether the book or the live service hints hold exactly `record`.
+    fn holds_record(&self, record: &ZakuraNodeRecord) -> bool {
+        let node_id = &record.body.node_id;
+        self.book
+            .get(node_id)
+            .is_some_and(|entry| entry.record() == record)
+            || self
+                .active_services
+                .get(node_id)
+                .and_then(|active| active.record.as_ref())
+                .is_some_and(|active| active == record)
+    }
+
     fn update_active_services_from_connected_record(
         &mut self,
         node_id: NodeId,
         record: ZakuraNodeRecord,
         services: Vec<ZakuraServiceId>,
         import_result: &Result<ImportOutcome, DiscoveryBookError>,
+        now: u64,
     ) {
+        // An expired hint no longer orders the peer's records.
         if self.active_services.get(&node_id).is_some_and(|active| {
-            active
-                .record
-                .as_ref()
-                .is_some_and(|active_record| record.body.sequence <= active_record.body.sequence)
+            active.record.as_ref().is_some_and(|active_record| {
+                active_record.body.expires_at_unix_secs >= now
+                    && record.body.sequence <= active_record.body.sequence
+            })
         }) {
             return;
         }
@@ -2506,10 +2636,11 @@ impl ZakuraDiscoveryInner {
                 .get(&node_id)
                 .is_some_and(|entry| entry.record() == &record),
             Ok(ImportOutcome::IgnoredOlder) => false,
-            Err(error) if is_direct_address_import_error(error) => self
-                .book
-                .get(&node_id)
-                .is_none_or(|entry| connected_record_is_fresh_for_stored_record(&record, entry)),
+            Err(error) if is_direct_address_import_error(error) => {
+                self.book.get(&node_id).is_none_or(|entry| {
+                    connected_record_is_fresh_for_stored_record(&record, entry, now)
+                })
+            }
             Err(_) => false,
         };
 
@@ -2686,6 +2817,20 @@ impl ZakuraDiscoveryBook {
         self.import_record_inner(record, source, false, false, now, context)
     }
 
+    /// Imports one peer record whose author checks already passed.
+    ///
+    /// The caller checked expiry too. Storage limits, address policy, and
+    /// sequence order still run here.
+    fn import_verified_record(
+        &mut self,
+        record: ZakuraNodeRecord,
+        source: Option<NodeId>,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+    ) -> Result<ImportOutcome, DiscoveryBookError> {
+        self.import_record_inner(record, source, false, true, now, context)
+    }
+
     /// Imports one signed static/bootstrap record.
     ///
     /// Static records are trusted-by-operator configuration, so this import path permits loopback
@@ -2717,7 +2862,7 @@ impl ZakuraDiscoveryBook {
         outcome: &mut ImportBatchOutcome,
     ) {
         for record in records {
-            match self.import_record_inner(record, source, false, true, now, context) {
+            match self.import_verified_record(record, source, now, context) {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
             }
@@ -3133,7 +3278,7 @@ impl ZakuraDiscoveryBook {
 
         let node_id = record.body.node_id;
         if let Some(entry) = self.entries.get_mut(&node_id) {
-            return Ok(update_existing_entry(entry, record, metadata));
+            return Ok(update_existing_entry(entry, record, metadata, now));
         }
 
         self.entries.insert(
@@ -3378,15 +3523,20 @@ fn update_existing_entry(
     entry: &mut ZakuraDiscoveryEntry,
     record: ZakuraNodeRecord,
     metadata: DiscoveryEntryMetadata,
+    now: u64,
 ) -> ImportOutcome {
     let incoming_sequence = record.body.sequence;
     let stored_sequence = entry.record.body.sequence;
+    // An expired record no longer orders its node's records, so a node that
+    // reset its sequence recovers once its old record expires.
+    let stored_orders = !entry_is_expired(entry, now);
 
-    if incoming_sequence < stored_sequence {
+    if stored_orders && incoming_sequence < stored_sequence {
         return ImportOutcome::IgnoredOlder;
     }
+    let same_sequence = stored_orders && incoming_sequence == stored_sequence;
 
-    let preserve_first_party_source = incoming_sequence == stored_sequence
+    let preserve_first_party_source = same_sequence
         && entry.source == Some(entry.record.body.node_id)
         && metadata.source != Some(entry.record.body.node_id);
 
@@ -3400,7 +3550,7 @@ fn update_existing_entry(
     // import (`last_confirmed: None`) keeps any earlier confirmation.
     entry.last_confirmed = entry.last_confirmed.max(metadata.last_confirmed);
 
-    if incoming_sequence == stored_sequence {
+    if same_sequence {
         return ImportOutcome::MetadataUpdated;
     }
 
@@ -3411,7 +3561,12 @@ fn update_existing_entry(
 fn connected_record_is_fresh_for_stored_record(
     record: &ZakuraNodeRecord,
     entry: &ZakuraDiscoveryEntry,
+    now: u64,
 ) -> bool {
+    // An expired record no longer orders the peer's records.
+    if entry_is_expired(entry, now) {
+        return true;
+    }
     match record.body.sequence.cmp(&entry.record.body.sequence) {
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => entry.record() == record,
@@ -3861,11 +4016,11 @@ fn node_id_sort_key(node_id: &NodeId) -> [u8; NODE_ID_BYTES] {
     *node_id.as_bytes()
 }
 
-fn validate_record_body_for_import(
+/// Check the record's network, chain, and protocol range against ours.
+fn validate_record_context(
     body: &ZakuraNodeRecordBody,
     context: &DiscoveryRecordValidationContext,
 ) -> Result<(), DiscoveryRecordError> {
-    validate_record_body_bounds(body)?;
     if body.network_id != context.expected_network_id {
         return Err(DiscoveryRecordError::WrongNetwork);
     }
@@ -3879,7 +4034,14 @@ fn validate_record_body_for_import(
     {
         return Err(DiscoveryRecordError::IncompatibleProtocol);
     }
+    Ok(())
+}
 
+/// Check the record's expiry against the local clock and TTL limit.
+pub(super) fn validate_record_expiry(
+    body: &ZakuraNodeRecordBody,
+    context: &DiscoveryRecordValidationContext,
+) -> Result<(), DiscoveryRecordError> {
     let skew = context.clock_skew_tolerance.as_secs();
     if body.expires_at_unix_secs.saturating_add(skew) < context.current_unix_secs {
         return Err(DiscoveryRecordError::Expired);
@@ -4966,6 +5128,79 @@ mod tests {
         assert!(honest.verify(&context()).is_ok());
     }
 
+    /// A record's author checks run before its expiry, so an expired or
+    /// incompatible record with a bad signature fails as a bad signature.
+    #[test]
+    fn bad_signature_outranks_expiry_and_protocol() {
+        let secret_key = secret_key();
+        let mut expired = body(&secret_key);
+        expired.expires_at_unix_secs = NOW - 3_600;
+        let mut expired = ZakuraNodeRecord::sign(expired, &secret_key).expect("test record signs");
+        assert!(matches!(
+            expired.verify(&context()),
+            Err(DiscoveryRecordError::Expired)
+        ));
+        expired.body.sequence += 1;
+        assert!(matches!(
+            expired.verify(&context()),
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+
+        let mut incompatible = body(&secret_key);
+        incompatible.zakura_protocol_min = u16::MAX;
+        incompatible.zakura_protocol_max = u16::MAX;
+        let mut incompatible =
+            ZakuraNodeRecord::sign(incompatible, &secret_key).expect("test record signs");
+        assert!(matches!(
+            incompatible.verify(&context()),
+            Err(DiscoveryRecordError::IncompatibleProtocol)
+        ));
+        incompatible.body.sequence += 1;
+        assert!(matches!(
+            incompatible.verify(&context()),
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+    }
+
+    /// A node that reset its sequence recovers once its stored record expires.
+    #[test]
+    fn expired_record_no_longer_orders_its_node() {
+        let secret_key = secret_key();
+        let node_id = secret_key.public();
+        let mut book = ZakuraDiscoveryBook::default();
+        let mut stored = body(&secret_key);
+        stored.sequence = 10;
+        stored.expires_at_unix_secs = NOW + 60;
+        let stored = ZakuraNodeRecord::sign(stored, &secret_key).expect("test record signs");
+        book.import_record(stored, Some(node_id), NOW, &context())
+            .expect("first record imports");
+
+        let mut reset = body(&secret_key);
+        reset.sequence = 1;
+        reset.expires_at_unix_secs = NOW + 3_600;
+        let reset = ZakuraNodeRecord::sign(reset, &secret_key).expect("test record signs");
+        assert_eq!(
+            book.import_record(reset.clone(), Some(node_id), NOW, &context())
+                .expect("an older record is ignored, not rejected"),
+            ImportOutcome::IgnoredOlder
+        );
+
+        let later = NOW + 120;
+        let later_context = DiscoveryRecordValidationContext {
+            current_unix_secs: later,
+            ..context()
+        };
+        assert_eq!(
+            book.import_record(reset.clone(), Some(node_id), later, &later_context)
+                .expect("the reset record imports after the stored one expires"),
+            ImportOutcome::Updated
+        );
+        assert_eq!(
+            book.get(&node_id).map(ZakuraDiscoveryEntry::record),
+            Some(&reset)
+        );
+    }
+
     #[test]
     fn signature_fails_with_wrong_domain_or_record_format_version() {
         let secret_key = secret_key();
@@ -5013,8 +5248,10 @@ mod tests {
     fn record_validation_rejects_expired_wrong_network_wrong_chain_and_protocol() {
         let record = signed_record();
 
-        let mut expired = record.clone();
-        expired.body.expires_at_unix_secs = NOW - context().clock_skew_tolerance.as_secs() - 1;
+        let secret_key = secret_key();
+        let mut expired = body(&secret_key);
+        expired.expires_at_unix_secs = NOW - context().clock_skew_tolerance.as_secs() - 1;
+        let expired = ZakuraNodeRecord::sign(expired, &secret_key).expect("test record signs");
         assert!(matches!(
             expired.verify(&context()),
             Err(DiscoveryRecordError::Expired)
@@ -7148,6 +7385,79 @@ mod tests {
         );
     }
 
+    /// A `Hello` identical to the stored record, in the book or only in the
+    /// live service hints, skips verification and needs no verification slot.
+    /// A changed record waits for a slot.
+    #[tokio::test]
+    async fn identical_hello_skips_verification() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let secret = secret_key();
+        let stored = runtime_record_with_secret(&secret, 1, service(1), test_addr(1));
+        let newer = runtime_record_with_secret(&secret, 2, service(1), test_addr(1));
+        let node_id = stored.body.node_id;
+        let addressless_secret = secret_key();
+        let addressless =
+            runtime_record_with_secret_and_addrs(&addressless_secret, 1, service(2), Vec::new());
+        let addressless_node_id = addressless.body.node_id;
+        connected_tx.send_replace(vec![peer_id_for(node_id), peer_id_for(addressless_node_id)]);
+        handle
+            .import_connected_peer_record(stored.clone(), node_id)
+            .await
+            .expect("the first hello imports");
+        assert!(matches!(
+            handle
+                .import_connected_peer_record(addressless.clone(), addressless_node_id)
+                .await,
+            Err(DiscoveryBookError::NoUsableDirectAddress)
+        ));
+
+        let held = handle.hold_verify_slots();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                handle.import_connected_peer_record(stored, node_id),
+            )
+            .await
+            .expect("an identical hello needs no verification slot")
+            .expect("an identical hello imports"),
+            ImportOutcome::MetadataUpdated
+        );
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                handle.import_connected_peer_record(addressless, addressless_node_id),
+            )
+            .await
+            .expect("an identical addressless hello needs no verification slot"),
+            Err(DiscoveryBookError::NoUsableDirectAddress)
+        ));
+        let waiting = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.import_connected_peer_record(newer, node_id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a changed hello waits for a verification slot"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), handle.record_for(node_id))
+                .await
+                .is_ok(),
+            "a hello waiting for a slot does not hold the discovery lock"
+        );
+
+        drop(held);
+        assert_eq!(
+            waiting
+                .await
+                .expect("the import task does not panic")
+                .expect("a changed hello imports once a slot is free"),
+            ImportOutcome::Updated
+        );
+    }
+
     #[tokio::test]
     async fn active_services_ignore_stale_and_equal_sequence_conflicting_hellos() {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -7252,6 +7562,35 @@ mod tests {
             .await
             .connected
             .is_empty());
+    }
+
+    /// A peer that reset its sequence and dropped its addresses regains its
+    /// services once its old dialable record expires.
+    #[tokio::test]
+    async fn addressless_reset_hello_replaces_an_expired_dialable_record() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let secret = secret_key();
+        let node_id = secret.public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+        // Expired, but within the clock-skew tolerance, so it imports.
+        let mut old = runtime_record_with_secret(&secret, 10, service(2), test_addr(2)).body;
+        old.expires_at_unix_secs = current_unix_secs() - 1;
+        let old = ZakuraNodeRecord::sign(old, &secret).expect("record signs");
+        handle
+            .import_connected_peer_record(old, node_id)
+            .await
+            .expect("a dialable record imports");
+
+        let reset = runtime_record_with_secret_and_addrs(&secret, 1, service(3), Vec::new());
+        assert!(matches!(
+            handle.import_connected_peer_record(reset, node_id).await,
+            Err(DiscoveryBookError::NoUsableDirectAddress)
+        ));
+        assert_eq!(
+            handle.active_services(node_id).await,
+            Some(vec![service(3)])
+        );
     }
 
     #[tokio::test]
@@ -8569,5 +8908,44 @@ mod tests {
         handle.import_peer_records([new], Some(author)).await;
 
         assert_eq!(sample, vec![old]);
+    }
+
+    #[test]
+    fn hello_verdicts_disconnect_only_for_records_no_conformant_peer_sends() {
+        use crate::zakura::discovery::protocol::DiscoveryWireError;
+
+        let disconnect = [
+            DiscoveryBookError::Record(DiscoveryRecordError::Wire(
+                DiscoveryWireError::InvalidProtocolRange,
+            )),
+            DiscoveryBookError::Record(DiscoveryRecordError::MalformedNodeId),
+            DiscoveryBookError::Record(DiscoveryRecordError::InvalidSignature),
+            DiscoveryBookError::Record(DiscoveryRecordError::WrongNetwork),
+            DiscoveryBookError::Record(DiscoveryRecordError::WrongChain),
+            DiscoveryBookError::Record(DiscoveryRecordError::IncompatibleProtocol),
+            DiscoveryBookError::MismatchedConnectedPeerRecord,
+        ];
+        for error in disconnect {
+            assert_eq!(hello_verdict(&error), RecordVerdict::Disconnect, "{error}");
+        }
+
+        let drop = [
+            DiscoveryBookError::Record(DiscoveryRecordError::Expired),
+            DiscoveryBookError::Record(DiscoveryRecordError::FarFutureExpiry),
+            DiscoveryBookError::SelfRecord,
+            DiscoveryBookError::NoUsableDirectAddress,
+            DiscoveryBookError::NonDialableDirectAddress {
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+            },
+            DiscoveryBookError::Limit {
+                field: "service",
+                actual: 9,
+                max: 8,
+            },
+            DiscoveryBookError::VerificationCancelled,
+        ];
+        for error in drop {
+            assert_eq!(hello_verdict(&error), RecordVerdict::Drop, "{error}");
+        }
     }
 }

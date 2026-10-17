@@ -30,13 +30,16 @@ use crate::zakura::{
 
 use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
-    BlockSyncServiceSummary, DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError,
-    GetServices, HeaderSyncServiceSummary, ServiceSummaryEnvelope, Services, ZakuraDiscoveryHandle,
-    ZakuraNodeRecord, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
+    hello_verdict, BlockSyncServiceSummary, DiscoveryMessage, GetServices,
+    HeaderSyncServiceSummary, RecordVerdict, ServiceSummaryEnvelope, Services,
+    ZakuraDiscoveryHandle, ZakuraNodeRecord, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_RECORDS_PER_RESPONSE, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use super::wire::{PEERS_MAX_BYTES, RULES};
-use crate::zakura::wire_codec::encode_frame;
+use crate::zakura::{
+    regulation::{CadenceSendError, CadenceSender},
+    wire_codec::encode_frame,
+};
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
 const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -90,11 +93,6 @@ impl DiscoveryPeerSession {
     /// Peer disconnect/local shutdown cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
-    }
-
-    /// Send this node's signed self-record.
-    pub fn try_send_hello(&self, record: ZakuraNodeRecord) -> Result<(), OrderedSendError> {
-        self.try_send_message(DiscoveryMessage::Hello { record })
     }
 
     /// Ask this peer for more peer records.
@@ -567,12 +565,13 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     // `PipeTeardown` still runs on every exit path.
     spawn_supervised_pipe(peer_id.clone(), sink_service_cancel, || {}, on_panic, pipe);
 
-    let source = DiscoverySource {
+    let mut source = DiscoverySource {
         handle: handle.clone(),
         session: discovery_session,
         conn_id,
         session_id,
         progress,
+        hello: CadenceSender::new(),
     };
     // SR-1: a panic in the source task skips its `service_cancel.cancel()`,
     // `handle.remove_session()`, and discovery-only connection cancellation,
@@ -642,30 +641,37 @@ struct DiscoverySink {
 
 async fn run_discovery_pipe(
     pipe: &mut Pipe<DsLocal, DsEnv>,
-    mut recv: FramedRecv,
+    recv: FramedRecv,
     sink: DiscoverySink,
 ) -> Result<(), SinkReject> {
     let cancel = sink.session.cancel_token();
-    loop {
-        let frame = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(()),
-            frame = recv.recv() => frame,
-        };
-        let Some(frame) = frame else {
-            return Ok(());
-        };
+    // A cancelled session drops its pending work, including a wait for a
+    // verification slot, so it neither holds the slot queue nor imports after
+    // its session ends.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Ok(()),
+        read = read_discovery_messages(pipe, recv, &sink) => read,
+    }
+}
 
+/// Runs each frame through the pipe and handles each decoded message, until
+/// the stream ends.
+async fn read_discovery_messages(
+    pipe: &mut Pipe<DsLocal, DsEnv>,
+    mut recv: FramedRecv,
+    sink: &DiscoverySink,
+) -> Result<(), SinkReject> {
+    while let Some(frame) = recv.recv().await {
         match pipe.run_one(frame) {
             Flow::Continue(()) | Flow::Done => {}
             Flow::Reject(reject) => return Err(reject),
         }
-
-        let Some(message) = pipe.local_mut().take_decoded() else {
-            continue;
-        };
-        sink.handle_message(message).await?;
+        if let Some(message) = pipe.local_mut().take_decoded() {
+            sink.handle_message(message).await?;
+        }
     }
+    Ok(())
 }
 
 impl DiscoverySink {
@@ -786,24 +792,21 @@ impl DiscoverySink {
         Ok(())
     }
 
+    /// Imports the peer's own record. An authentic record counts as initial
+    /// progress even when local policy drops it.
     async fn handle_hello(&self, record: ZakuraNodeRecord) -> Result<(), SinkReject> {
-        if record.body.node_id != self.peer_node_id {
-            return Err(SinkReject::protocol(
-                "Zakura discovery hello authored by a different node id",
-            ));
-        }
-        match self
+        if let Err(error) = self
             .handle
             .import_connected_peer_record(record, self.peer_node_id)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(error) if is_advisory_self_record_import_error(&error) => {
-                tracing::debug!(?error, "ignoring advisory discovery hello import error");
-                Ok(())
+            match hello_verdict(&error) {
+                RecordVerdict::Drop => {
+                    tracing::debug!(?error, "dropped Zakura discovery hello");
+                }
+                RecordVerdict::Disconnect => return Err(SinkReject::protocol(error)),
             }
-            Err(error) => Err(SinkReject::protocol(error)),
-        }?;
+        }
         self.progress.mark_hello();
         Ok(())
     }
@@ -852,10 +855,12 @@ struct DiscoverySource {
     conn_id: ZakuraConnId,
     session_id: u64,
     progress: Arc<DiscoveryExchangeProgress>,
+    /// Paces `Hello` to its row's send interval.
+    hello: CadenceSender<DiscoveryMessage>,
 }
 
 impl DiscoverySource {
-    async fn run_initial_exchange(&self) -> bool {
+    async fn run_initial_exchange(&mut self) -> bool {
         if self.exchange().await.is_err() {
             return false;
         }
@@ -875,7 +880,7 @@ impl DiscoverySource {
             .await
     }
 
-    async fn refresh_after_interval(&self) -> Result<(), ()> {
+    async fn refresh_after_interval(&mut self) -> Result<(), ()> {
         let cancel = self.session.cancel_token();
         let refresh_interval = discovery_exchange_interval(self.handle.refresh_interval().await);
         tokio::select! {
@@ -889,7 +894,7 @@ impl DiscoverySource {
     ///
     /// Returns `Err(())` once the stream's send side is gone, so the caller
     /// stops the periodic loop.
-    async fn exchange(&self) -> Result<(), ()> {
+    async fn exchange(&mut self) -> Result<(), ()> {
         if !self
             .handle
             .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
@@ -910,7 +915,8 @@ impl DiscoverySource {
                 );
             })?;
         let record = (*record).clone();
-        self.handle_send_result(self.session.try_send_hello(record))?;
+        let sent = self.send_hello(record);
+        self.handle_send_result(sent)?;
 
         let limit = u16::try_from(
             self.handle
@@ -927,6 +933,20 @@ impl DiscoverySource {
         ))?;
 
         self.handle_send_result(self.session.try_send_get_services(Vec::new()))
+    }
+
+    /// Sends `record` as `Hello` if the row's interval has passed and the
+    /// previous `Hello` was written. Otherwise the next exchange offers a
+    /// fresh record.
+    fn send_hello(&mut self, record: ZakuraNodeRecord) -> Result<(), OrderedSendError> {
+        self.hello
+            .update(DiscoveryMessage::Hello { record })
+            .map_err(|error| OrderedSendError::Encode(error.into()))?;
+        match self.hello.send_due(&self.session.send) {
+            Ok(_) => Ok(()),
+            Err(CadenceSendError::Closed) => Err(OrderedSendError::Closed),
+            Err(error) => Err(OrderedSendError::Encode(error.into())),
+        }
     }
 
     fn handle_send_result(&self, result: Result<(), OrderedSendError>) -> Result<(), ()> {
@@ -1003,21 +1023,6 @@ fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     NodeId::from_bytes(&bytes).ok()
 }
 
-/// A peer-hello import error that should be logged and ignored rather than
-/// closing the live connection. These mean the peer's record is not locally
-/// dialable or has drifted out of the freshness window, neither of which is the
-/// connected peer's fault.
-fn is_advisory_self_record_import_error(error: &DiscoveryBookError) -> bool {
-    matches!(
-        error,
-        DiscoveryBookError::NoUsableDirectAddress
-            | DiscoveryBookError::NonDialableDirectAddress { .. }
-            | DiscoveryBookError::Record(DiscoveryRecordError::Expired)
-            | DiscoveryBookError::Record(DiscoveryRecordError::FarFutureExpiry)
-    )
-}
-
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1640,6 +1645,113 @@ mod tests {
         (sink, recv)
     }
 
+    /// An authentic expired `Hello` counts as initial progress. The same
+    /// record with a bad signature disconnects, although it is also expired.
+    #[tokio::test]
+    async fn expired_hello_counts_as_progress_unless_its_signature_fails(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[48u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_secret = NodeSecretKey::from_bytes(&[49u8; 32]);
+        let peer_node_id = peer_secret.public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        let (sink, _recv) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+
+        let mut body = signed_discovery_record(&peer_secret, &handshake)?.body;
+        body.expires_at_unix_secs = current_test_unix_secs() - 3_600;
+        let expired = ZakuraNodeRecord::sign(body, &peer_secret)?;
+        let mut forged = expired.clone();
+        forged.body.sequence += 1;
+
+        assert!(matches!(
+            sink.handle_hello(forged).await,
+            Err(SinkReject::Protocol(_))
+        ));
+        assert!(!sink.progress.hello.load(Ordering::Relaxed));
+
+        sink.handle_hello(expired)
+            .await
+            .expect("an authentic expired hello is dropped, not rejected");
+        assert!(sink.progress.hello.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    /// A cancelled session's reader drops a `Hello` that waits for a
+    /// verification slot. It leaves the slot queue and never imports the
+    /// record.
+    #[tokio::test]
+    async fn cancelled_session_drops_a_hello_waiting_for_a_verification_slot(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[50u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_secret = NodeSecretKey::from_bytes(&[51u8; 32]);
+        let peer_node_id = peer_secret.public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit,
+        );
+        let (sink, _sink_recv) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let cancel = sink.session.cancel_token();
+        let (peer_send, recv) = framed_channel(8);
+        peer_send
+            .send(discovery_frame(DiscoveryMessage::Hello {
+                record: signed_discovery_record(&peer_secret, &handshake)?,
+            })?)
+            .await?;
+
+        let held = handle.hold_verify_slots();
+        let mut pipe = discovery_pipe(peer_id.clone());
+        let reader = tokio::spawn(async move { run_discovery_pipe(&mut pipe, recv, sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!reader.is_finished(), "the hello waits for a slot");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the cancelled reader stops while the slots stay held")?
+            .expect("a cancelled session ends without a rejection");
+        let slots = held.len();
+        drop(held);
+        assert_eq!(
+            handle.hold_verify_slots().len(),
+            slots,
+            "the cancelled hello took no verification slot"
+        );
+        assert_eq!(handle.record_for(peer_node_id).await, None);
+        Ok(())
+    }
+
     /// The `DiscoverySink` session guard must drop messages from a superseded stream generation.
     ///
     /// A replacement discovery stream re-admits the peer under a higher `session_id`.
@@ -2027,6 +2139,84 @@ mod tests {
         Ok(())
     }
 
+    /// Returns the authors of the `Hello` frames queued on `recv`, draining
+    /// every queued frame.
+    fn drain_hello_authors(recv: &mut FramedRecv) -> Vec<NodeId> {
+        use futures::FutureExt;
+
+        let mut authors = Vec::new();
+        while let Some(Some(frame)) = recv.recv().now_or_never() {
+            if let DiscoveryMessage::Hello { record } =
+                decode_frame::<DiscoveryMessage>(&frame).expect("the source encodes valid frames")
+            {
+                authors.push(record.body.node_id);
+            }
+        }
+        authors
+    }
+
+    /// The source sends `Hello` once per send interval: an exchange inside the
+    /// interval sends none, and the first exchange after it sends the current
+    /// self-record.
+    #[tokio::test(start_paused = true)]
+    async fn exchange_resends_hello_once_its_interval_passes() -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let local_secret = NodeSecretKey::from_bytes(&[52u8; 32]);
+        let local_node_id = local_secret.public();
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: local_secret,
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = NodeSecretKey::from_bytes(&[53u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        let (send, mut recv) = framed_channel(8);
+        let mut source = DiscoverySource {
+            handle: handle.clone(),
+            session: DiscoveryPeerSession {
+                peer_id,
+                direction: ServicePeerDirection::Inbound,
+                send,
+                cancel: CancellationToken::new(),
+            },
+            conn_id: 2,
+            session_id: 1,
+            progress: Arc::new(DiscoveryExchangeProgress::default()),
+            hello: CadenceSender::new(),
+        };
+
+        source.exchange().await.expect("the session is current");
+        assert_eq!(drain_hello_authors(&mut recv), vec![local_node_id]);
+
+        source.exchange().await.expect("the session is current");
+        assert_eq!(
+            drain_hello_authors(&mut recv),
+            Vec::new(),
+            "an exchange inside the interval sends no Hello"
+        );
+
+        tokio::time::advance(super::super::wire::SEND_INTERVAL).await;
+        source.exchange().await.expect("the session is current");
+        assert_eq!(drain_hello_authors(&mut recv), vec![local_node_id]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stale_discovery_source_cannot_send_after_stream_replacement(
     ) -> Result<(), crate::BoxError> {
@@ -2056,7 +2246,7 @@ mod tests {
         );
 
         let (send, mut recv) = framed_channel(4);
-        let source = DiscoverySource {
+        let mut source = DiscoverySource {
             handle: handle.clone(),
             session: DiscoveryPeerSession {
                 peer_id: peer_id.clone(),
@@ -2067,6 +2257,7 @@ mod tests {
             conn_id: 2,
             session_id: 1,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
+            hello: CadenceSender::new(),
         };
         assert_eq!(
             handle
@@ -2115,7 +2306,7 @@ mod tests {
 
         let (send, mut recv) = framed_channel(4);
         let progress = Arc::new(DiscoveryExchangeProgress::default());
-        let source = DiscoverySource {
+        let mut source = DiscoverySource {
             handle: handle.clone(),
             session: DiscoveryPeerSession {
                 peer_id: peer_id.clone(),
@@ -2126,6 +2317,7 @@ mod tests {
             conn_id: 2,
             session_id: 1,
             progress: progress.clone(),
+            hello: CadenceSender::new(),
         };
         let source_task = tokio::spawn(async move { source.run_initial_exchange().await });
         for _ in 0..3 {
@@ -2176,7 +2368,7 @@ mod tests {
         );
 
         let (send, _recv) = framed_channel(4);
-        let source = DiscoverySource {
+        let mut source = DiscoverySource {
             handle,
             session: DiscoveryPeerSession {
                 peer_id,
@@ -2187,6 +2379,7 @@ mod tests {
             conn_id: 2,
             session_id: 1,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
+            hello: CadenceSender::new(),
         };
 
         assert!(
@@ -2232,19 +2425,23 @@ mod tests {
         )
     }
 
-    async fn wait_for_next_discovery_hello(
+    /// Waits for the source's next refresh, a `GetPeers`. The refresh comes
+    /// well inside `Hello`'s send interval, so it carries no second `Hello`.
+    async fn wait_for_next_discovery_refresh(
         peer_recv: &mut FramedRecv,
-    ) -> Result<ZakuraNodeRecord, crate::BoxError> {
+    ) -> Result<(), crate::BoxError> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let frame = peer_recv
                     .recv()
                     .await
                     .expect("discovery refresh stream remains open");
-                if let DiscoveryMessage::Hello { record } =
-                    decode_frame::<DiscoveryMessage>(&frame)?
-                {
-                    return Ok(record);
+                match decode_frame::<DiscoveryMessage>(&frame)? {
+                    DiscoveryMessage::GetPeers { .. } => return Ok(()),
+                    DiscoveryMessage::Hello { .. } => {
+                        panic!("a Hello waits for its send interval")
+                    }
+                    _ => {}
                 }
             }
         })
@@ -2364,7 +2561,7 @@ mod tests {
         wait_for_discovery_inbound_peers(&handle, 1).await;
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
-        wait_for_next_discovery_hello(&mut peer_recv).await?;
+        wait_for_next_discovery_refresh(&mut peer_recv).await?;
         assert!(
             tokio::time::timeout(Duration::from_millis(100), connection_cancel.cancelled())
                 .await
@@ -2437,7 +2634,7 @@ mod tests {
         wait_for_discovery_inbound_peers(&handle, 1).await;
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
-        wait_for_next_discovery_hello(&mut peer_recv).await?;
+        wait_for_next_discovery_refresh(&mut peer_recv).await?;
         assert!(
             tokio::time::timeout(Duration::from_millis(100), connection_cancel.cancelled())
                 .await
@@ -2527,11 +2724,7 @@ mod tests {
         wait_for_discovery_inbound_peers(&discovery_handle, 1).await;
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
-        let refreshed_record = wait_for_next_discovery_hello(&mut peer_recv).await?;
-        assert_eq!(
-            refreshed_record.body.node_id,
-            discovery_handle.local_node_id()
-        );
+        wait_for_next_discovery_refresh(&mut peer_recv).await?;
         assert_eq!(discovery_handle.peer_snapshot().inbound_peers, 1);
         assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
         assert!(
