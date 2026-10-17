@@ -147,7 +147,7 @@ const STATUS: MessageRule = MessageRule {
 };
 
 /// Opens, renews, and closes a subscription.
-const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
+pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
     message_type: message_type::SUBSCRIBE_HEADERS,
     payload: PayloadLen::of::<UpdatePayload>(),
     role: MessageRole::Subscription {

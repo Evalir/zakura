@@ -2150,7 +2150,8 @@ mod zakura_header_sync_driver_tests {
             )
             .await
             .expect("the first durable header driver starts");
-            let mut snapshots = startup.committed_snapshots.clone();
+            // The port's selected-chain watch follows the durable commits.
+            let mut snapshots = startup.header_chain_port.selected_chain();
             let genesis_snapshot = wait_for_header_snapshot(&mut snapshots, block::Height(0)).await;
             let suffix: Vec<_> = blocks[..4]
                 .iter()
