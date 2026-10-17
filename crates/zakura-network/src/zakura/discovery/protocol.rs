@@ -382,6 +382,14 @@ pub struct GetServices {
     pub wanted_services: Vec<ZakuraServiceId>,
 }
 
+impl GetServices {
+    /// Whether this query asks for `service`. An empty wanted list asks for
+    /// every service.
+    pub(crate) fn wants(&self, service: &ZakuraServiceId) -> bool {
+        self.wanted_services.is_empty() || self.wanted_services.contains(service)
+    }
+}
+
 /// First-party live service summary response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Services {
