@@ -244,7 +244,7 @@ impl Store {
 }
 
 /// A port over a [`Store`], with a selected chain the test moves.
-struct FakePort {
+pub(crate) struct FakePort {
     key: AdapterKey,
     store: Mutex<Store>,
     genesis: Frontier,
@@ -260,7 +260,7 @@ struct FakePort {
 impl FakePort {
     /// A store holding the Regtest genesis header, selected, with `gate`
     /// read permits.
-    fn new(gate: usize) -> Arc<Self> {
+    pub(crate) fn new(gate: usize) -> Arc<Self> {
         let store = Store::default();
         let genesis = store.tree.genesis;
         Arc::new(Self {
@@ -300,7 +300,7 @@ impl FakePort {
     }
 
     /// Extend the selected chain by `count` headers and select the new tip.
-    fn grow(&self, count: u32) -> Vec<Frontier> {
+    pub(crate) fn grow(&self, count: u32) -> Vec<Frontier> {
         let added = self.store().tree.extend(self.tip(), count);
         if let Some(&tip) = added.last() {
             self.select(tip);
@@ -2309,9 +2309,10 @@ proptest! {
 }
 
 /// The real subscriber, on an in-process session.
-fn real_subscriber() -> super::super::subscriber::Subscriber<HB> {
+fn real_subscriber() -> super::super::subscriber::Subscriber {
     use crate::zakura::{regulation::WriterFence, CloseCause};
     super::super::subscriber::Subscriber::new(
+        HB,
         WriterFence::new(CancellationToken::new(), CloseCause::default()),
         &framed_channel(1).1,
     )
@@ -2330,7 +2331,7 @@ fn advertised(tip: Frontier) -> super::super::Status {
 /// validated and applying each due `Grant`.
 async fn follow(
     harness: &mut Harness,
-    subscriber: &mut super::super::subscriber::Subscriber<HB>,
+    subscriber: &mut super::super::subscriber::Subscriber,
     staging: u32,
 ) -> Vec<Received> {
     let mut received = Vec::new();
