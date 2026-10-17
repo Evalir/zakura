@@ -293,7 +293,8 @@ struct HeaderSyncReactor {
     /// Deadlines until which the reactor refuses header-sync readmission to dropped peers.
     ///
     /// Each entry represents one admitted session that survived
-    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts.
+    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts,
+    /// or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     peer_work_queue: PeerWorkQueue,
@@ -1971,7 +1972,7 @@ impl HeaderSyncReactor {
                             vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
                         );
                     }
-                    self.handle_typed_failure(peer, source, &error);
+                    self.handle_typed_failure(peer, source, Some(owner), &error);
                 }
                 HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
                     let blocked = self.vct_repair.get_mut(repair_owner).is_some_and(|task| {
@@ -1997,7 +1998,7 @@ impl HeaderSyncReactor {
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::Failed(error) => {
-                self.handle_typed_failure(peer, source, &error);
+                self.handle_typed_failure(peer, source, Some(owner), &error);
             }
             HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
                 self.ordinary_resource_stall = self
@@ -2112,7 +2113,7 @@ impl HeaderSyncReactor {
                 } else {
                     self.retire_peer_work(&peer, HeaderRequestTerminal::TargetRejected);
                 }
-                self.handle_typed_failure(peer, source, &error);
+                self.handle_typed_failure(peer, source, Some(owner), &error);
             }
         }
     }
@@ -4315,7 +4316,7 @@ impl HeaderSyncReactor {
             |owner| zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
         );
         let failure = zakura_header_chain::HeaderChainError::local_resource(subject, None);
-        self.handle_typed_failure(peer.clone(), source, &failure);
+        self.handle_typed_failure(peer.clone(), source, None, &failure);
 
         if context.operation == "query_header_locator" {
             self.peer_work_queue.remove_unstarted(peer);
@@ -4495,13 +4496,7 @@ impl HeaderSyncReactor {
         }
         state.session.cancel_token().cancel();
 
-        let cooldown = self.startup.config.unproductive_peer_cooldown;
-        if !cooldown.is_zero() {
-            let now = Instant::now();
-            let _ = self.prune_unproductive_cooldowns(now);
-            self.unproductive_peer_cooldowns
-                .insert(peer.clone(), now + cooldown);
-        }
+        self.start_readmission_cooldown(peer);
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         self.dispatch_action(HeaderPortOperation::DropPeer {
             peer: peer.clone(),
@@ -4509,6 +4504,17 @@ impl HeaderSyncReactor {
             reason,
         });
         self.handle_peer_disconnected(peer, session_id, reason);
+    }
+
+    /// Refuse `peer` header-sync readmission for the configured cooldown.
+    fn start_readmission_cooldown(&mut self, peer: &ZakuraPeerId) {
+        let cooldown = self.startup.config.unproductive_peer_cooldown;
+        if !cooldown.is_zero() {
+            let now = Instant::now();
+            let _ = self.prune_unproductive_cooldowns(now);
+            self.unproductive_peer_cooldowns
+                .insert(peer.clone(), now + cooldown);
+        }
     }
 
     fn prune_unproductive_cooldowns(&mut self, now: Instant) -> bool {
@@ -4712,10 +4718,14 @@ impl HeaderSyncReactor {
         self.close_subscription(&peer);
     }
 
+    /// Count `error`, and dispatch it as `peer`'s violation when it is an
+    /// automatic header-peer fault of `source`. See [`Self::dispatch_misbehavior`]
+    /// for `owner`.
     fn handle_typed_failure(
         &mut self,
         peer: ZakuraPeerId,
         source: zakura_header_chain::SourceId,
+        owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
         error: &zakura_header_chain::HeaderChainError,
     ) {
         metrics::counter!(
@@ -4740,9 +4750,14 @@ impl HeaderSyncReactor {
             }
             _ => return,
         };
-        self.dispatch_misbehavior(peer, reason);
+        self.dispatch_misbehavior(peer, reason, owner);
     }
 
+    /// Record a violation that a reactor check found in an admitted page.
+    ///
+    /// It does not disconnect. These checks compare the page with local
+    /// scheduler state, so a mismatch can be local. The session reader
+    /// already disconnects for the reservation violations themselves.
     fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
         let category = match reason {
             HeaderSyncMisbehavior::MalformedMessage => {
@@ -4758,14 +4773,26 @@ impl HeaderSyncReactor {
             "attribution" => "header_peer",
         )
         .increment(1);
-        self.dispatch_misbehavior(peer, reason);
+        self.dispatch_misbehavior(peer, reason, None);
     }
 
-    fn dispatch_misbehavior(&mut self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
-        let session_id = self
-            .peer_state
-            .get(&peer)
-            .map(|state| state.session.session_id());
+    /// Record `peer`'s violation. A fault in `owner`'s work also disconnects
+    /// the session that did that work, while it is still current, and its
+    /// subscription never acknowledges the failed cursor. The peer then waits
+    /// out the readmission cooldown, so it cannot reconnect and restage the
+    /// same branch at once.
+    fn dispatch_misbehavior(
+        &mut self,
+        peer: ZakuraPeerId,
+        reason: HeaderSyncMisbehavior,
+        owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
+    ) {
+        let session = self.peer_state.get(&peer).map(|state| &state.session);
+        let session_id = session.map(|session| session.session_id());
+        let faulted = owner.filter(|owner| Some(owner.session_id()) == session_id);
+        if let (Some(owner), Some(session)) = (faulted, session) {
+            session.disconnect_for_header_fault(owner.request_id().get());
+        }
         self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
             row.insert(
                 hs_trace::EVENT.into(),
@@ -4785,8 +4812,19 @@ impl HeaderSyncReactor {
                 .into(),
             );
             row.insert(hs_trace::BOUNDARY.into(), "engine".into());
-            row.insert(hs_trace::DISPOSITION.into(), "record".into());
+            row.insert(
+                hs_trace::DISPOSITION.into(),
+                if faulted.is_some() {
+                    "disconnect"
+                } else {
+                    "record"
+                }
+                .into(),
+            );
         });
+        if faulted.is_some() {
+            self.start_readmission_cooldown(&peer);
+        }
         let _ = self.dispatch_action(HeaderPortOperation::Misbehavior { peer, reason });
     }
 }
