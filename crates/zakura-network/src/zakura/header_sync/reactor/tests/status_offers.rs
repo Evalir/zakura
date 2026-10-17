@@ -808,3 +808,91 @@ fn status_during_repair_keeps_its_ordinary_attempt() {
         snapshot.frontiers.header_best,
     );
 }
+
+/// A full cadence burst of repeated statuses from each of `peers` peers
+/// starts one locator read, and another peer's new target still starts at
+/// once. The port never answers, so each read stays pending, as under a slow
+/// state.
+#[allow(clippy::print_stderr)]
+fn status_flood(peers: u8) {
+    // The `Status` cadence capacity.
+    const BURST: usize = 602;
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = v9::FakePort::new(0);
+    startup.use_direct_port();
+    let (_, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let flooders: Vec<_> = (0..peers).map(|byte| connect(&mut reactor, byte)).collect();
+    let (honest, _outbound) = connect(&mut reactor, 0xff);
+    let flooded = block::Hash([0x42; 32]);
+    let started = std::time::Instant::now();
+    for _ in 0..BURST {
+        for (peer, _) in &flooders {
+            reactor.handle_status(peer.clone(), 0, status_for(&snapshot, flooded));
+            reactor.schedule_cached_statuses();
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(reactor.pending_port_operations.len(), 1);
+    reactor.handle_status(honest, 0, status_for(&snapshot, block::Hash([0x43; 32])));
+    assert_eq!(reactor.pending_port_operations.len(), 2);
+    let statuses = BURST * flooders.len();
+    eprintln!(
+        "status_flood peers={peers} statuses={statuses} elapsed={elapsed:?} ns_per_status={}",
+        elapsed.as_nanos() / u128::try_from(statuses).expect("fits u128"),
+    );
+}
+
+/// Sixteen flooding peers, on every pull request.
+#[test]
+fn status_floods_start_no_repeated_work() {
+    status_flood(16);
+}
+
+/// Every peer a one-byte test identity allows but the honest one, in
+/// full-coverage CI runs.
+#[test]
+#[ignore = "broad load run; full-coverage CI passes --run-ignored"]
+fn maximum_status_floods_start_no_repeated_work() {
+    status_flood(255);
+}
+
+/// A status for another tip that arrives while a target applies stays
+/// unspent. If the reactor stages it before it sees the applied snapshot, the
+/// snapshot retires that attempt and stages the tip again under the new header
+/// authority, with no further status from the peer.
+#[test]
+fn a_new_tip_during_application_starts_under_the_applied_authority() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let (peer, _outbound) = connect(&mut reactor, 0x71);
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 0);
+    let next_tip = block::Hash([0x43; 32]);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, next_tip));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the applying target holds the peer"
+    );
+
+    // The target applies, and the reactor schedules before the new snapshot.
+    reactor.handle_header_target_admission_ready(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetAdmissionResult::Applied,
+    );
+    reactor.schedule_cached_statuses();
+    let stale = expect_locator_query(&mut actions, &peer, next_tip);
+
+    let mut applied = snapshot;
+    applied.state_version = applied.state_version.checked_next().unwrap();
+    applied.header_generation = applied.header_generation.checked_next().unwrap();
+    reactor.observe_latest_committed_snapshot(applied.clone());
+    let current = expect_locator_query(&mut actions, &peer, next_tip);
+    assert_ne!(current, stale);
+    assert_eq!(current.header_generation, applied.header_generation);
+}
