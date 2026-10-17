@@ -54,7 +54,7 @@ pub(crate) const HS_SENT_CURSOR_RING: u32 = 4_096;
 pub(crate) const HEADERS_RESPONSE_FIXED_BYTES: usize = <PageFixed as Wire>::MAX_LEN;
 
 /// Most locator hashes an `Open` carries.
-const MAX_LOCATOR_HASHES: usize = 13;
+pub(crate) const MAX_LOCATOR_HASHES: usize = 13;
 
 /// Bytes of one body-size hint.
 const BODY_SIZE_BYTES: usize = 4;
