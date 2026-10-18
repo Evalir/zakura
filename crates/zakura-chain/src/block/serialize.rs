@@ -8,7 +8,10 @@ use chrono::{TimeZone, Utc};
 use hex::{FromHex, FromHexError};
 
 use crate::{
-    block::{header::ZCASH_BLOCK_VERSION, merkle, Block, CountedHeader, Hash, Header},
+    block::{
+        header::{HEADER_BYTES_BEFORE_SOLUTION, MAX_SERIALIZED_HEADER_BYTES, ZCASH_BLOCK_VERSION},
+        merkle, Block, CountedHeader, Hash, Header,
+    },
     serialization::{
         CompactSizeMessage, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
@@ -62,7 +65,24 @@ pub(crate) fn validate_header_version(version: u32) -> Result<(), &'static str> 
 }
 
 impl ZcashSerialize for Header {
-    crate::serialization::compile_serialize_entry_points_here!();
+    #[inline(never)]
+    fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        self.zcash_serialize(out)
+    }
+
+    /// Allocates once, sized for the largest (Mainnet and Testnet) header.
+    /// A Regtest header leaves the rest of that capacity unused.
+    fn zcash_serialize_to_vec(&self) -> Result<Vec<u8>, io::Error> {
+        let mut out = Vec::with_capacity(MAX_SERIALIZED_HEADER_BYTES);
+        self.zcash_serialize_into_vec(&mut out)?;
+        Ok(out)
+    }
+
+    /// Every header field has a fixed size except the Equihash solution, whose
+    /// size depends only on the network, so this needs no encoder pass.
+    fn zcash_serialized_size(&self) -> usize {
+        HEADER_BYTES_BEFORE_SOLUTION + self.solution.zcash_serialized_size()
+    }
 
     #[allow(clippy::unwrap_in_result)]
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
