@@ -43,6 +43,10 @@ use zakura_quic::{
 
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::peer_memory::{
+    budgeted_max_connections, max_connections_for_budget, PeerMemoryBudgetError,
+    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+};
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
@@ -79,8 +83,9 @@ use crate::{
     },
 };
 
-/// Default total Zakura connections when P2P v2 is enabled.
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
+/// Default total Zakura connections when P2P v2 is enabled: as many as the
+/// default peer memory budget admits (see `peer_memory`).
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
 /// Default per-IP Zakura connection cap.
 pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 /// Default simultaneous Zakura control handshakes.
@@ -314,7 +319,25 @@ pub struct ZakuraConfig {
     /// `docs/specs/zakura-quic.md` section 9 for every key and its range.
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
+    ///
+    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
+    /// larger value at startup.
     pub max_connections: usize,
+    /// Bytes of QUIC flow-control credit and queued datagrams that admitted
+    /// native peers together may make this node hold.
+    ///
+    /// Each connection can hold its `[network.zakura.quic]` receive and send
+    /// windows, 64 MiB at the defaults, whether or not the node reads. Each
+    /// bound socket can also queue 256 MiB of datagrams, however many
+    /// connections it serves (zakura-quic CTRL-26 lists what this leaves
+    /// out). The node reserves one socket queue per bound socket and admits at
+    /// most the rest divided by the per-connection cost, so the default 8 GiB
+    /// admits 124 connections on the one socket `listen_addr` binds, and a
+    /// larger `max_connections` is lowered at startup.
+    /// Startup fails when the budget admits fewer than 16 connections, or
+    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
+    /// peers), or fewer than `max_connections` when that is smaller.
+    pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
@@ -365,6 +388,7 @@ impl Default for ZakuraConfig {
             nat_traversal: false,
             quic: QuicConfig::default(),
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
+            peer_memory_budget_bytes: DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
             max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
@@ -385,6 +409,52 @@ impl ZakuraConfig {
         } else {
             self.max_connections_per_ip
         }
+    }
+
+    /// Return the connection cap after the peer memory budget (see
+    /// [`budgeted_max_connections`]), or an error naming the keys when the
+    /// budget admits too few connections.
+    ///
+    /// The floor counts distinct bootstrap identities, as discovery does.
+    /// Without the node key it can't tell whether one of them is this node, so
+    /// it counts one fewer: it never refuses a config that
+    /// [`Self::budgeted_max_connections_for_node`] accepts.
+    pub fn budgeted_max_connections(&self) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(None)
+    }
+
+    /// Like [`Self::budgeted_max_connections`], but leaves `local_node_id` out
+    /// of the bootstrap count, exactly as discovery does.
+    pub fn budgeted_max_connections_for_node(
+        &self,
+        local_node_id: NodeId,
+    ) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(Some(local_node_id))
+    }
+
+    fn budgeted_max_connections_excluding(
+        &self,
+        local_node_id: Option<NodeId>,
+    ) -> Result<usize, PeerMemoryBudgetError> {
+        budgeted_max_connections(
+            self.max_connections,
+            self.peer_memory_budget_bytes,
+            self.bound_socket_count(),
+            self.quic.connection_memory_bytes(),
+            match local_node_id {
+                Some(local_node_id) => {
+                    remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
+                }
+                // One entry may be this node's own.
+                None => remote_bootstrap_peer_count(&self.bootstrap_peers, None).saturating_sub(1),
+            },
+        )
+    }
+
+    /// Returns how many sockets the native endpoint binds for this config (see
+    /// `native_bind_addrs`), each with its own datagram queue.
+    fn bound_socket_count(&self) -> u64 {
+        u64::try_from(native_bind_addrs(self.listen_addr).len()).unwrap_or(u64::MAX)
     }
 
     /// Return the default bootstrap peers for `network`.
@@ -456,7 +526,17 @@ impl ZakuraLocalLimits {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         Self {
             quic: config.zakura.quic.clone(),
-            max_connections: config.zakura.max_connections.max(1),
+            // The floor only decides whether endpoint startup refuses the
+            // config, so the cap is the budget's count either way.
+            max_connections: config
+                .zakura
+                .max_connections
+                .max(1)
+                .min(max_connections_for_budget(
+                    config.zakura.peer_memory_budget_bytes,
+                    config.zakura.bound_socket_count(),
+                    config.zakura.quic.connection_memory_bytes(),
+                )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: config.zakura.quic.idle_timeout(),
             keep_alive_interval: config.zakura.quic.keep_alive_interval(),
@@ -3835,11 +3915,16 @@ fn advertises_no_discovery_address(config: &Config, advertised: &[SocketAddr]) -
     config.zakura.listen_addr.is_some() && advertised.is_empty()
 }
 
-fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
+/// Counts the distinct parseable bootstrap identities other than `local_node_id`.
+fn remote_bootstrap_peer_count(
+    bootstrap_peers: &[String],
+    local_node_id: impl Into<Option<NodeId>>,
+) -> usize {
+    let local_node_id = local_node_id.into();
     bootstrap_peers
         .iter()
         .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
-        .filter(|node_addr| node_addr.id != local_node_id)
+        .filter(|node_addr| Some(node_addr.id) != local_node_id)
         .map(|node_addr| node_addr.id)
         .collect::<HashSet<_>>()
         .len()
@@ -4000,10 +4085,24 @@ async fn spawn_zakura_endpoint_inner(
         .block_sync
         .validate()
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
-    let limits = ZakuraLocalLimits::from_config(config);
-    validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
+    let budgeted_max_connections = config
+        .zakura
+        .budgeted_max_connections_for_node(local_node_id)?;
+    if budgeted_max_connections < config.zakura.max_connections {
+        warn!(
+            max_connections = config.zakura.max_connections,
+            budgeted_max_connections,
+            peer_memory_budget_bytes = config.zakura.peer_memory_budget_bytes,
+            connection_memory_bytes = config.zakura.quic.connection_memory_bytes(),
+            "lowering [network.zakura] max_connections to what peer_memory_budget_bytes \
+             admits at the configured QUIC windows; raise the budget or lower \
+             max_connections to silence this"
+        );
+    }
+    let limits = ZakuraLocalLimits::from_config(config);
+    validate_idle_invariant(&limits)?;
     let discovery_secret_key = secret_key.clone();
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
@@ -4037,7 +4136,7 @@ async fn spawn_zakura_endpoint_inner(
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),
         &handshake_config,
-        config.zakura.max_connections,
+        limits.max_connections,
         remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
         supervisor.subscribe(),
     )?;
@@ -4121,6 +4220,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync.clone(),
         block_sync.clone(),
         trace.clone(),
+        limits.max_connections,
     ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let service_demand = header_sync_driver_startup

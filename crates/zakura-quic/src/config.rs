@@ -10,6 +10,8 @@ use quinn_proto::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::driver::SOCKET_QUEUE_BYTES;
+
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
@@ -18,6 +20,30 @@ const GIB: u64 = 1024 * MIB;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u32 = 10;
 /// Default pending handshakes above which unvalidated sources get a Retry (CTRL-22).
 pub const DEFAULT_RETRY_THRESHOLD: u32 = 8;
+
+/// Payload bytes one connection's flow-control credit can make this node hold,
+/// whether or not the application reads (CTRL-26).
+///
+/// That is unread data up to the receive window and our unacknowledged data up
+/// to the send window. Per-stream receive windows sit inside the connection
+/// window, so they add nothing. Queued datagrams are bounded per socket instead
+/// (see [`SOCKET_DATAGRAM_QUEUE_BYTES`]). Reassembly bookkeeping, allocator
+/// overhead and our writes still waiting for send credit come on top, so this
+/// is not a resident-memory ceiling.
+pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_bytes: u64) -> u64 {
+    // Widening u32 to u64 is lossless. Saturating keeps an unvalidated window
+    // from wrapping to a small cost.
+    (receive_window_bytes as u64).saturating_add(send_window_bytes)
+}
+
+/// Datagram bytes one bound socket can queue for its connection tasks, however
+/// many connections it serves (DRV-3, CTRL-26).
+///
+/// Connection tasks drain this queue whether or not the application reads, so
+/// it doesn't grow with unread data.
+// Widening the driver's usize constant to u64 is lossless on every supported
+// target.
+pub const SOCKET_DATAGRAM_QUEUE_BYTES: u64 = SOCKET_QUEUE_BYTES as u64;
 
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,6 +233,11 @@ impl QuicConfig {
         check("dial_stagger_ms", self.dial_stagger_ms, 0, 5000)?;
         check("kernel_drop_poll_secs", self.kernel_drop_poll_secs, 1, 300)?;
         Ok(())
+    }
+
+    /// [`connection_memory_bytes`] for this config's windows (CTRL-26).
+    pub fn connection_memory_bytes(&self) -> u64 {
+        connection_memory_bytes(self.receive_window_bytes, self.send_window_bytes)
     }
 
     /// The connection idle timeout (CTRL-10).
@@ -413,6 +444,19 @@ mod tests {
         assert_eq!(config.handshake_timeout_secs, Some(10));
         assert_eq!(config.retry_threshold, Some(8));
         assert_eq!(config.congestion_controller, CongestionController::Cubic);
+    }
+
+    #[test]
+    fn connection_memory_counts_both_windows() {
+        // 32 MiB received and 32 MiB sent.
+        assert_eq!(QuicConfig::default().connection_memory_bytes(), 64 * MIB);
+        let config = QuicConfig {
+            receive_window_bytes: 1 << 30,
+            send_window_bytes: GIB,
+            ..QuicConfig::default()
+        };
+        assert_eq!(config.connection_memory_bytes(), 2 * GIB);
+        assert_eq!(SOCKET_DATAGRAM_QUEUE_BYTES, 256 * MIB);
     }
 
     #[test]
