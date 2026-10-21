@@ -14,9 +14,9 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected three days after the committed October 15, 2026 Mainnet
+/// Projected three days after the committed October 19, 2026 Mainnet
 /// release-state bundle at the Mainnet target spacing.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_520_728;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_525_116;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -235,12 +235,12 @@ mod tests {
             Some(MAINNET_EOS_HEIGHT),
         );
         // 27 days of estimated blocks cross the ZIP 259 NU7 activation:
-        // 22,676 blocks at 75 seconds reach the block before activation
-        // (3,543,404) in 1,700,700 seconds, and the remaining 632,100
-        // seconds add 25,284 blocks at 25 seconds.
+        // 18,288 blocks at 75 seconds reach the block before activation
+        // (3,543,404) in 1,371,600 seconds, and the remaining 961,200
+        // seconds add 38,448 blocks at 25 seconds.
         assert_eq!(
             estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
-            Height(3_568_688),
+            Height(3_581_852),
         );
     }
 
