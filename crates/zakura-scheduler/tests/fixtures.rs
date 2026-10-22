@@ -423,6 +423,41 @@ fn shutdown_finishes_a_release_sequence_in_a_drop() {
 }
 
 #[test]
+fn panic_in_a_leftover_drop_leaves_no_run_behind() {
+    use std::sync::Arc;
+    struct PanicOnDrop;
+    // `Waker::noop()` has no drop to panic in, so this needs its own waker.
+    #[allow(clippy::manual_noop_waker)]
+    impl std::task::Wake for PanicOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("leftover drop panicked");
+        }
+    }
+    let shutdown = std::panic::catch_unwind(|| {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let task = s.spawn_root(
+            "task",
+            poll_fn(|_| {
+                // Once this copy drops, the timer holds the last reference,
+                // so shutdown drops the waker as a leftover.
+                let waker = Waker::from(Arc::new(PanicOnDrop));
+                let deadline = SimInstant::from_start(std::time::Duration::from_secs(1));
+                hooks::register_timer(deadline, &waker);
+                Poll::<()>::Pending
+            }),
+        );
+        s.run(task.task());
+        s.shutdown()
+    });
+    assert!(shutdown.is_err(), "the leftover's drop panicked");
+    // Used to fail with "this thread already has a running Scheduler".
+    drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
+}
+
+#[test]
 fn shutdown_force_unwinds_only_a_lock_cycle() {
     use zakura_scheduler::RunOutcome::Parked;
     let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
@@ -582,6 +617,22 @@ fn hooks_do_nothing_outside_a_run() {
     assert_eq!(hooks::new_object(), None);
     // Returns at once instead of suspending.
     hooks::preempt(zakura_scheduler::Point::here(zakura_scheduler::Op::Lock));
+}
+
+#[test]
+fn spawn_from_setup_code_is_ready_at_once() {
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let ran = shared(Cell::new(false));
+    let flag = ran.clone();
+    // Outside any task, as when a harness builds a component that spawns.
+    let handle = hooks::spawn("setup", async move { flag.set(true) });
+    assert_eq!(
+        s.ready().iter().map(|t| t.task).collect::<Vec<_>>(),
+        [handle.task()]
+    );
+    s.run(handle.task());
+    assert!(ran.get());
+    assert_eq!(s.status(), Status::Quiescent);
 }
 
 /// A future that, on its first poll, runs `before_point`, reaches a

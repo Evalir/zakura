@@ -80,6 +80,9 @@ pub(crate) struct RunState {
     object_counts: BTreeMap<Option<TaskId>, u32>,
     root_counts: BTreeMap<&'static str, u32>,
     pub(crate) shutting_down: bool,
+    /// Panic payloads of tasks that panicked, until a joiner takes them.
+    #[cfg(zakura_sim)]
+    pub(crate) panics: BTreeMap<TaskId, Box<dyn std::any::Any + Send>>,
 }
 
 impl RunState {
@@ -141,6 +144,10 @@ impl RunState {
             child_counts: BTreeMap::new(),
         });
         self.spawn_queue.push((id, task));
+        if parent.is_none() {
+            // Setup code between steps. `run` admits it before its next step.
+            self.ready.insert(id);
+        }
         Ok(id)
     }
 
@@ -150,6 +157,34 @@ impl RunState {
         let limit = with_run(|s| s.max_tasks).unwrap_or(0);
         drop(rejected);
         panic!("run spawned more than max_tasks ({limit}) tasks");
+    }
+
+    /// Takes everything left in the run whose destructor can run arbitrary
+    /// code: queued tasks, timer and join wakers, and unjoined panic payloads.
+    fn take_leftovers(&mut self) -> Vec<Box<dyn std::any::Any>> {
+        let mut left: Vec<Box<dyn std::any::Any>> = Vec::new();
+        left.extend(
+            std::mem::take(&mut self.spawn_queue)
+                .into_iter()
+                .map(|(_, task)| Box::new(task) as _),
+        );
+        left.extend(
+            std::mem::take(&mut self.timers)
+                .into_values()
+                .map(|waker| Box::new(waker) as _),
+        );
+        left.extend(
+            std::mem::take(&mut self.join_wakers)
+                .into_values()
+                .map(|wakers| Box::new(wakers) as _),
+        );
+        #[cfg(zakura_sim)]
+        left.extend(
+            std::mem::take(&mut self.panics)
+                .into_values()
+                .map(|payload| Box::new(payload) as _),
+        );
+        left
     }
 
     /// Allocates the next object identity for the current task.
@@ -223,6 +258,22 @@ const STACK_POOL_LIMIT: usize = 1024;
 /// past it are force-unwound instead, so cleanup always ends.
 const DRAIN_STEP_LIMIT: usize = 100_000;
 
+/// Takes this thread's run state when dropped, even if shutdown panics, so
+/// later runs on the thread can still start. During a panic it leaks what the
+/// state still holds, since dropping that could panic again and abort.
+struct ClearRun;
+
+impl Drop for ClearRun {
+    fn drop(&mut self) {
+        let state = RUN.with(|r| r.borrow_mut().take());
+        if std::thread::panicking() {
+            std::mem::forget(state);
+        } else {
+            drop(state);
+        }
+    }
+}
+
 /// Runs `f` on this thread's run state, or returns `None` outside a run.
 pub(crate) fn with_run<R>(f: impl FnOnce(&mut RunState) -> R) -> Option<R> {
     RUN.with(|r| r.borrow_mut().as_mut().map(f))
@@ -295,6 +346,10 @@ pub struct Scheduler {
     coroutines: Vec<Option<Co>>,
     stack_size: usize,
     shut_down: bool,
+    /// Keeps this scheduler installed as `zakura-rt`'s executor until the
+    /// run's state is gone.
+    #[cfg(zakura_sim)]
+    rt_run: Option<zakura_rt::sim::RunGuard>,
 }
 
 impl Scheduler {
@@ -308,9 +363,17 @@ impl Scheduler {
         let gen = NEXT_GEN.get() + 1;
         NEXT_GEN.set(gen);
         RUN.with(|r| {
-            let mut r = r.borrow_mut();
-            assert!(r.is_none(), "this thread already has a running Scheduler");
-            *r = Some(RunState {
+            assert!(
+                r.borrow().is_none(),
+                "this thread already has a running Scheduler"
+            );
+        });
+        // Enter before installing the state, so a panic here leaves no run
+        // state behind to block later runs on this thread.
+        #[cfg(zakura_sim)]
+        let rt_run = zakura_rt::sim::enter(&crate::executor::EXECUTOR);
+        RUN.with(|r| {
+            *r.borrow_mut() = Some(RunState {
                 gen,
                 workers: usize::from(config.workers),
                 max_tasks: config.max_tasks,
@@ -333,12 +396,16 @@ impl Scheduler {
                 object_counts: BTreeMap::new(),
                 root_counts: BTreeMap::new(),
                 shutting_down: false,
+                #[cfg(zakura_sim)]
+                panics: BTreeMap::new(),
             });
         });
         Scheduler {
             coroutines: Vec::new(),
             stack_size: config.stack_size,
             shut_down: false,
+            #[cfg(zakura_sim)]
+            rt_run: Some(rt_run),
         }
     }
 
@@ -387,6 +454,8 @@ impl Scheduler {
     ///
     /// If `task` isn't in [`ready`](Self::ready).
     pub fn run(&mut self, task: TaskId) -> RunOutcome {
+        // Setup code may have spawned through the hooks since the last step.
+        self.admit();
         self.state(|s| {
             assert!(
                 s.eligible().any(|t| t == task),
@@ -452,6 +521,8 @@ impl Scheduler {
                     .map(|s| s.to_string())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
+                #[cfg(zakura_sim)]
+                self.state(|s| s.panics.insert(task, payload));
                 (RunOutcome::Panicked(msg), Some(TaskExit::Panicked))
             }
         };
@@ -564,6 +635,7 @@ impl Scheduler {
             return CleanupReport::default();
         }
         self.shut_down = true;
+        let clear_run = ClearRun;
         let timers_left = self.state(|s| {
             s.shutting_down = true;
             let live = (0..s.tasks.len())
@@ -609,10 +681,21 @@ impl Scheduler {
             self.finish(task, TaskExit::Cancelled);
             self.admit();
         }
-        // Dropping the state drops leftover wakers and futures outside the
-        // borrow, since their destructors may call hooks.
-        let state = RUN.with(|r| r.borrow_mut().take());
-        drop(state);
+        // Drop what's left outside the borrow, while the run and the
+        // `zakura-rt` executor are both still installed, since destructors
+        // may call hooks or queue more. Then nothing in the state runs code.
+        loop {
+            let left = self.state(RunState::take_leftovers);
+            if left.is_empty() {
+                break;
+            }
+            drop(left);
+        }
+        drop(clear_run);
+        // After the state, so destructors above still found `zakura-rt`'s
+        // executor. On a panic, dropping the `Scheduler` drops this instead.
+        #[cfg(zakura_sim)]
+        drop(self.rt_run.take());
         report
     }
 
@@ -621,6 +704,8 @@ impl Scheduler {
     /// cancels. Picks the lowest `TaskId`, so cleanup replays too.
     fn drain(&mut self, report: &mut CleanupReport) {
         for _ in 0..DRAIN_STEP_LIMIT {
+            // Setup code may have spawned since the last step.
+            self.admit();
             let next = self.state(|s| {
                 s.ready
                     .iter()
