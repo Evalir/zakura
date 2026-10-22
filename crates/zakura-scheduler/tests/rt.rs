@@ -17,7 +17,10 @@ use std::{
 use support::*;
 use zakura_rt::{
     sim,
-    sync::{Notify, Semaphore},
+    sync::{
+        atomic::{AtomicU64 as RtAtomicU64, Ordering as RtOrdering},
+        Mutex as RtMutex, Notify, Semaphore,
+    },
     task::{self, JoinSet},
     time::{self, Instant},
 };
@@ -389,4 +392,197 @@ fn back_to_back_release(s: &mut Scheduler) -> Check {
 #[test]
 fn release_points_split_back_to_back_drops() {
     assert!(first_violation(2, FIND, back_to_back_release).is_some());
+}
+
+/// Two tasks load and then store one `zakura-rt` atomic.
+fn rt_lost_update(s: &mut Scheduler) -> Check {
+    let counter = Arc::new(RtAtomicU64::new(0));
+    for label in ["inc_a", "inc_b"] {
+        let counter = counter.clone();
+        s.spawn_root(label, async move {
+            let v = counter.load(RtOrdering::SeqCst);
+            counter.store(v + 1, RtOrdering::SeqCst);
+        });
+    }
+    Box::new(move |_| {
+        let v = counter.load(RtOrdering::SeqCst);
+        (v != 2).then(|| format!("counter = {v}"))
+    })
+}
+
+#[test]
+fn rt_atomics_find_the_lost_update() {
+    assert!(first_violation(2, FIND, rt_lost_update).is_some());
+    assert_eq!(first_violation(1, FIND, rt_lost_update), None);
+}
+
+/// Checks capacity under one lock, then reserves under a second lock.
+fn rt_snapshot_reserve(fixed: bool) -> impl Fn(&mut Scheduler) -> Check {
+    move |s| {
+        let available = Arc::new(RtMutex::new(1i64));
+        for label in ["res_a", "res_b"] {
+            let available = available.clone();
+            s.spawn_root(label, async move {
+                if fixed {
+                    let mut guard = available.lock().unwrap();
+                    if *guard >= 1 {
+                        *guard -= 1;
+                    }
+                } else {
+                    let ok = *available.lock().unwrap() >= 1;
+                    if ok {
+                        *available.lock().unwrap() -= 1;
+                    }
+                }
+            });
+        }
+        Box::new(move |r| {
+            let v = *available.lock().unwrap();
+            (v < 0 || r.status != Status::Quiescent).then(|| format!("{v}, {:?}", r.status))
+        })
+    }
+}
+
+#[test]
+fn rt_mutex_parks_contended_tasks() {
+    assert!(first_violation(2, FIND, rt_snapshot_reserve(false)).is_some());
+    assert_eq!(first_violation(2, CLEAN, rt_snapshot_reserve(true)), None);
+}
+
+/// Two tasks take two `zakura-rt` mutexes in opposite orders.
+fn rt_ab_ba(s: &mut Scheduler) -> Check {
+    let a = Arc::new(RtMutex::new(()));
+    let b = Arc::new(RtMutex::new(()));
+    for (label, first, second) in [("ab", a.clone(), b.clone()), ("ba", b, a)] {
+        s.spawn_root(label, async move {
+            let _first = first.lock().unwrap();
+            let _second = second.lock().unwrap();
+        });
+    }
+    Box::new(|r| (r.status == Status::Deadlock).then(|| "deadlock".to_owned()))
+}
+
+#[test]
+fn rt_mutex_reports_a_lock_cycle_as_deadlock() {
+    assert!(first_violation(2, FIND, rt_ab_ba).is_some());
+}
+
+#[test]
+fn rt_mutex_held_across_await_starves_one_worker() {
+    let held_across_await = |s: &mut Scheduler| -> Check {
+        let lock = Arc::new(RtMutex::new(()));
+        let held = lock.clone();
+        s.spawn_root("holder", async move {
+            #[allow(clippy::await_holding_lock)]
+            {
+                let _guard = held.lock().unwrap();
+                time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        s.spawn_root("waiter", async move {
+            drop(lock.lock().unwrap());
+        });
+        Box::new(|r| (r.status == Status::WorkerStarved).then(|| "starved".to_owned()))
+    };
+    assert!(first_violation(1, FIND, held_across_await).is_some());
+    assert_eq!(first_violation(2, CLEAN, held_across_await), None);
+}
+
+/// Runs `task` until it returns `Pending`, which leaves it waiting at a poll
+/// boundary.
+fn run_until_waiting(s: &mut Scheduler, task: zakura_scheduler::TaskId) {
+    while s.run(task) != zakura_scheduler::RunOutcome::Waiting {}
+}
+
+#[test]
+fn shutdown_leaves_a_mutex_held_by_an_idle_task_unpoisoned() {
+    // A forced unwind dropped the guard while panicking, which poisons a std
+    // mutex. Shutdown now cancels the idle holder instead.
+    let lock = Arc::new(RtMutex::new(()));
+    let held = lock.clone();
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = held.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    run_until_waiting(&mut s, holder.task());
+    let report = s.shutdown();
+    assert!(!lock.is_poisoned());
+    assert_eq!((report.cancelled, report.unwound), (1, 0));
+}
+
+#[test]
+fn shutdown_lets_a_drop_take_a_contended_mutex() {
+    // `dropper`'s destructor locks the mutex `holder` keeps across an await.
+    // A forced unwind ran that destructor while panicking, so `park` refused
+    // and the contended-lock assert aborted the process.
+    struct LockOnDrop(Arc<RtMutex<()>>, Arc<AtomicBool>);
+    impl Drop for LockOnDrop {
+        fn drop(&mut self) {
+            drop(self.0.lock().unwrap());
+            self.1.store(true, Ordering::Relaxed);
+        }
+    }
+    let lock = Arc::new(RtMutex::new(()));
+    let locked = Arc::new(AtomicBool::new(false));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = LockOnDrop(lock.clone(), locked.clone());
+    let dropper = s.spawn_root("dropper", async move {
+        let _guard = guard;
+        pending::<()>().await
+    });
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = lock.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    run_until_waiting(&mut s, dropper.task());
+    run_until_waiting(&mut s, holder.task());
+    let report = s.shutdown();
+    assert!(locked.load(Ordering::Relaxed));
+    assert_eq!((report.cancelled, report.unwound), (2, 0));
+}
+
+#[test]
+fn mutex_kept_across_runs_gets_a_fresh_identity() {
+    use zakura_scheduler::RunOutcome::Parked;
+    let kept = Arc::new(RtMutex::new(()));
+    // Run 1: the first lock made by task 0 names the mutex.
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let used = kept.clone();
+    let task = s.spawn_root("user", async move { drop(used.lock().unwrap()) });
+    while s.status() == Status::Running {
+        s.run(task.task());
+    }
+    drop(s);
+
+    // Run 2: task 0 locks a fresh mutex first, so it gets the same identity
+    // the kept mutex cached in run 1.
+    let fresh = Arc::new(RtMutex::new(()));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let (f, k) = (fresh.clone(), kept.clone());
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _f = f.lock().unwrap();
+            let _k = k.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    let wait_fresh = s.spawn_root("wait_fresh", async move { drop(fresh.lock().unwrap()) });
+    let wait_kept = s.spawn_root("wait_kept", async move { drop(kept.lock().unwrap()) });
+    run_until_waiting(&mut s, holder.task());
+    let parked_on = |s: &mut Scheduler, task: zakura_scheduler::JoinHandle| loop {
+        if let Parked(object) = s.run(task.task()) {
+            break object;
+        }
+    };
+    let fresh_id = parked_on(&mut s, wait_fresh);
+    let kept_id = parked_on(&mut s, wait_kept);
+    assert_ne!(fresh_id, kept_id);
 }
