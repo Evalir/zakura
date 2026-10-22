@@ -3526,6 +3526,7 @@ name = "zakura-scheduler"
 version = "0.1.0"
 dependencies = [
  "corosensei",
+ "rand 0.10.2",
  "tokio",
  "zakura-rt",
 ]

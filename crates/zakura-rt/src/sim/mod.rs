@@ -87,6 +87,10 @@ pub trait Executor {
     /// Marks whether the current task waits on a source outside the
     /// scheduler, so an idle run isn't reported as a deadlock.
     fn set_external_wait(&self, waiting: bool);
+
+    /// A random choice for `site`, taken from the run's `Plan`. Returns a
+    /// value below `bound`, or any `u64` when `bound` is 0.
+    fn draw(&self, site: DrawSite, bound: u64) -> u64;
 }
 
 /// The run installed on a thread.
@@ -164,6 +168,8 @@ pub fn enter(executor: &'static dyn Executor) -> RunGuard {
         let id = RunId(NEXT_RUN.fetch_add(1, Ordering::Relaxed));
         cell.set(Some(Run { executor, id }));
     });
+    crate::collections::reset_run_seed();
+    crate::rand::reset_run_stream();
     RunGuard {
         _not_send: PhantomData,
     }
@@ -179,6 +185,8 @@ pub struct RunGuard {
 impl Drop for RunGuard {
     fn drop(&mut self) {
         let _ = RUN.try_with(|cell| cell.set(None));
+        crate::collections::reset_run_seed();
+        crate::rand::reset_run_stream();
     }
 }
 
@@ -303,6 +311,28 @@ pub enum Op {
     Watch,
 }
 
+/// Where a random choice comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum DrawKind {
+    /// The seed of the run's `zakura_rt::rand::rng()` stream, drawn once by
+    /// the first value.
+    Rng,
+    /// The first branch an unbiased `select!` polls.
+    Select,
+    /// The run's hash seed, drawn once by the first hashed collection.
+    HashSeed,
+}
+
+/// A random choice's kind and the source location that asked for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawSite {
+    /// What the draw is for.
+    pub kind: DrawKind,
+    /// Where production code asked for it.
+    pub site: &'static Location<'static>,
+}
+
 /// A preemption point, as a runtime primitive reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
@@ -339,5 +369,37 @@ impl Point {
 pub(crate) fn point(op: Op, site: &'static Location<'static>) {
     if let Some(executor) = executor() {
         executor.preempt(Point::at(op, site));
+    }
+}
+
+/// Tokio, for the sim `select!`, which expands to tokio's macro.
+#[doc(hidden)]
+pub use tokio as __tokio;
+
+/// The branch a sim `select!` polls first, with the poll's preemption point.
+///
+/// Not for direct use. `zakura_rt::select!` calls it on every poll, through
+/// tokio's internal start-index rule. A biased select always starts at 0.
+/// Outside a run, an unbiased one uses tokio's thread RNG, as in production.
+#[doc(hidden)]
+#[track_caller]
+pub fn select_start(branches: u32, biased: bool) -> u32 {
+    let site = Location::caller();
+    point(Op::Select, site);
+    if biased {
+        return 0;
+    }
+    match executor() {
+        Some(executor) => {
+            let start = executor.draw(
+                DrawSite {
+                    kind: DrawKind::Select,
+                    site,
+                },
+                u64::from(branches),
+            );
+            u32::try_from(start).expect("a draw below `branches` fits in u32")
+        }
+        None => tokio::macros::support::thread_rng_n(branches),
     }
 }
