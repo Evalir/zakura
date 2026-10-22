@@ -1296,7 +1296,7 @@ impl ZakuraPeerHandle {
         message_type: u16,
         flags: u16,
         payload: Vec<u8>,
-        started: Option<oneshot::Sender<()>>,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Vec<Frame>, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
@@ -1335,7 +1335,10 @@ pub enum ZakuraOutboundFrame {
         payload: Vec<u8>,
         /// Fired when the connection takes this request off its queue and
         /// starts the exchange, since it serves one request at a time.
-        started: Option<oneshot::Sender<()>>,
+        ///
+        /// Only legacy gossip sets it, and legacy code stays on tokio, so this
+        /// is tokio's sender in both builds.
+        started: Option<tokio::sync::oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
     },
@@ -1808,11 +1811,9 @@ impl Drop for RegisteredPeerCleanupGuard {
         let supervisor = self.supervisor.clone();
         let peer_id = self.peer_id.clone();
         let conn_id = self.conn_id;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _task = handle.spawn(erased(async move {
-                supervisor.deregister(&peer_id, conn_id).await;
-            }));
-        }
+        let _task = zakura_rt::task::try_spawn(erased(async move {
+            supervisor.deregister(&peer_id, conn_id).await;
+        }));
     }
 }
 
@@ -2035,7 +2036,7 @@ impl ServiceSessionState {
                 self.install_demand_wait(
                     waits,
                     Box::pin(async move {
-                        zakura_rt::time::sleep_until(at.into()).await;
+                        zakura_rt::time::sleep_until(at).await;
                     }),
                 );
             }
@@ -8967,7 +8968,7 @@ mod tests {
         );
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(waits.len(), 1);
@@ -8994,7 +8995,7 @@ mod tests {
         );
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(session.reopen_attempts, 1);
@@ -9013,7 +9014,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(session.schedule_transport_backoff(&mut waits), None);
@@ -9033,7 +9034,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
         session.schedule_demand(&mut waits, SessionDemand::Retire);
 
@@ -9091,7 +9092,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
         tokio::time::advance(Duration::from_secs(60)).await;
         let (kind, ()) = waits
