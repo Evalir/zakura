@@ -273,6 +273,29 @@ fn livelock_counts_advances_that_leave_the_clock_still() {
 }
 
 #[test]
+fn harness_text_in_records_has_no_debug_output() {
+    let script = zakura_sim::PlanInput::Script(Plan {
+        choices: vec![zakura_sim::PlanChoice::Draw(zakura_sim::HexU64(42))],
+    });
+    let (_, lines) = support::recorded(
+        config(2, 100),
+        script,
+        |sim| {
+            sim.scheduler().spawn_root("a", async {});
+            sim.scheduler().spawn_root("b", async {});
+        },
+        &mut NoChecks,
+    );
+    let Ok(zakura_sim::Record::End(end)) = serde_json::from_str(lines.last().unwrap()) else {
+        panic!("the last record is end");
+    };
+    assert_eq!(
+        end.harness.as_deref(),
+        Some("the run asked for a pick, but the script has draw 0x2a")
+    );
+}
+
+#[test]
 fn livelock_on_a_sync_spin_still_shuts_down() {
     // Runs on its own thread, so a hang fails the test instead of the suite.
     let (done, finished) = std::sync::mpsc::channel();
@@ -385,7 +408,11 @@ fn abandoned_sim_with_a_waiting_source<T: Send + 'static>(
 
 #[test]
 fn an_abandoned_run_forgets_its_sources() {
-    let leaked = abandoned_sim_with_a_waiting_source(|sim| sim.run(&mut NoChecks).cleanup.leaked);
+    let leaked = abandoned_sim_with_a_waiting_source(|sim| {
+        sim.run(&mut NoChecks, &mut zakura_sim::MemorySink::default())
+            .cleanup
+            .leaked
+    });
     assert_eq!(leaked, 1);
 }
 

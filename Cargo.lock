@@ -3558,6 +3558,10 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
+ "zakura-chain",
+ "zakura-network",
+ "zakura-node-services",
  "zakura-rt",
  "zakura-scheduler",
 ]
