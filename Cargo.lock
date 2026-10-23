@@ -2871,7 +2871,6 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
- "lazy_static",
  "libc",
  "log",
  "metrics",
@@ -2962,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "10.0.0"
+version = "10.0.1"
 dependencies = [
  "bech32",
  "bitflags",
@@ -2982,7 +2981,6 @@ dependencies = [
  "hex",
  "incrementalmerkletree",
  "itertools 0.14.0",
- "lazy_static",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -3021,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "11.0.0"
+version = "12.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3033,9 +3031,7 @@ dependencies = [
  "futures-util",
  "getset",
  "hex",
- "lazy_static",
  "metrics",
- "once_cell",
  "pin-project",
  "proptest",
  "proptest-derive",
@@ -3122,7 +3118,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3187,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "10.0.0"
+version = "11.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -3200,7 +3196,6 @@ dependencies = [
  "hex",
  "indexmap",
  "itertools 0.14.0",
- "lazy_static",
  "metrics",
  "pin-project",
  "proptest",
@@ -3446,7 +3441,6 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
- "lazy_static",
  "libc",
  "metrics",
  "proptest",
@@ -3538,10 +3532,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "hex",
- "lazy_static",
  "ripemd",
  "secp256k1",
  "sha2",
@@ -3584,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "11.0.0"
+version = "11.0.1"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3597,7 +3590,6 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "metrics",
- "once_cell",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -3625,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "eyre",
  "futures",
@@ -3633,8 +3625,6 @@ dependencies = [
  "indexmap",
  "insta",
  "itertools 0.14.0",
- "lazy_static",
- "once_cell",
  "proptest",
  "rand 0.10.2",
  "regex",
