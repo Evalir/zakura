@@ -3564,6 +3564,7 @@ dependencies = [
  "zakura-chain",
  "zakura-network",
  "zakura-node-services",
+ "zakura-quic",
  "zakura-rt",
  "zakura-scheduler",
 ]
