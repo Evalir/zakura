@@ -1593,9 +1593,14 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
         tokio::spawn(async move { rpc.z_get_treestate(height.0.to_string()).await });
 
     read_state
-        .expect_request(ReadRequest::Block(height.into()))
+        .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
-        .respond(ReadResponse::Block(Some(block)));
+        .respond(ReadResponse::BlockHeader {
+            header: block.header.clone(),
+            hash: block_hash,
+            height,
+            next_block_hash: None,
+        });
 
     read_state
         .expect_request(ReadRequest::SaplingTree(block_hash.into()))
@@ -1621,6 +1626,128 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
 
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
+}
+
+/// A pruned node must serve `z_gettreestate` below its prune height.
+///
+/// Pruning removes the block bodies. It keeps the headers, the hash index and the note
+/// commitment trees. Thus a pruned node must give the same treestate as an archive node. A
+/// wallet server asks for the treestate at the wallet birthday. This height is usually much
+/// lower than the prune height.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_serves_pruned_heights() {
+    let _init_guard = zakura_test::init();
+
+    // Sapling activates at height 2. Thus most test heights have a Sapling tree.
+    let network = Parameters::build()
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            sapling: Some(2),
+            nu5: Some(11),
+            ..Default::default()
+        })
+        .expect("failed to set activation heights")
+        .clear_funding_streams()
+        .with_network_name("pruned_treestate_testnet")
+        .expect("failed to set network name")
+        .to_network()
+        .expect("failed to build configured network");
+
+    let blocks: Vec<Arc<Block>> = network
+        .blockchain_iter()
+        .map(|(_, block_bytes)| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let tip_height = Height(u32::try_from(blocks.len() - 1).expect("test chain fits in a u32"));
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    // Create an archive state service.
+    let (_, archive_read_state, archive_tip, _) =
+        zakura_state::populated_state(blocks.clone(), &network).await;
+
+    // Create a pruned state service. In pruned mode, a checkpoint commit does not keep the
+    // bodies of blocks below `max_checkpoint_height - tx_retention + 1`. This value puts that
+    // height at the test chain tip.
+    let pruning = zakura_state::PruningConfig::default();
+    let max_checkpoint_height = Height(pruning.tx_retention + tip_height.0 - 1);
+    let config = zakura_state::Config {
+        storage_mode: zakura_state::StorageMode::Pruned(pruning),
+        ..zakura_state::Config::ephemeral()
+    };
+    let (pruned_state, pruned_read_state, pruned_tip, _) =
+        zakura_state::init(config, &network, max_checkpoint_height, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+    let pruned_state = Buffer::new(pruned_state, 1);
+
+    for block in &blocks {
+        pruned_state
+            .clone()
+            .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                block.clone().into(),
+            ))
+            .await
+            .expect("test chain blocks are valid");
+    }
+
+    // Make one RPC handler for each state service.
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (archive_rpc, archive_rpc_tx_queue) = mock_rpc(
+        network.clone(),
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(archive_read_state, 1),
+        archive_tip,
+        rx.clone(),
+    );
+    let (pruned_rpc, pruned_rpc_tx_queue) = mock_rpc(
+        network.clone(),
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(pruned_read_state.clone(), 1),
+        pruned_tip,
+        rx,
+    );
+
+    // Genesis and the tip keep their bodies. Thus examine only the heights between them.
+    for (i, block) in blocks.iter().enumerate().take(blocks.len() - 1).skip(1) {
+        let hash = block.hash();
+        let height = Height(u32::try_from(i).expect("test chain fits in a u32"));
+
+        let zakura_state::ReadResponse::Block(pruned_block) = pruned_read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::Block(height.into()))
+            .await
+            .expect("block read succeeds")
+        else {
+            panic!("unexpected response to Block request")
+        };
+        assert!(
+            pruned_block.is_none(),
+            "the pruned node must not have the body at height {height:?}"
+        );
+
+        for hash_or_height in [HashOrHeight::from(height), hash.into()] {
+            let expected_result = archive_rpc
+                .z_get_treestate(hash_or_height.to_string())
+                .await
+                .expect("an archive node has the treestate");
+
+            let treestate = pruned_rpc
+                .z_get_treestate(hash_or_height.to_string())
+                .await
+                .expect("a pruned node keeps the treestate below the prune height");
+
+            assert_eq!(treestate, expected_result);
+        }
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+
+    // The queue tasks must continue to run without errors or panics.
+    assert!(archive_rpc_tx_queue.now_or_never().is_none());
+    assert!(pruned_rpc_tx_queue.now_or_never().is_none());
 }
 
 /// A `z_getsubtreesbyindex` inside a fast-synced node's absent band must fail loudly.
