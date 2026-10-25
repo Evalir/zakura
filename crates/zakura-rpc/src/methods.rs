@@ -3049,19 +3049,26 @@ where
         //
         // For consistency, this lookup must be performed first, then all the other lookups must
         // be based on the hash.
+        let response = match read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
+                // Reference for the legacy error code:
+                // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
+                return Err("the requested block is not in the main chain")
+                    .map_error(server::error::LegacyCode::InvalidParameter);
+            }
+            Err(error) => return Err(error).map_misc_error(),
+        };
         let zakura_state::ReadResponse::BlockHeader {
             header,
             hash,
             height,
             ..
-        } = read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
-            .await
-            .map_err(|_| "the requested block is not in the main chain")
-            // Reference for the legacy error code:
-            // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
-            .map_error(server::error::LegacyCode::InvalidParameter)?
+        } = response
         else {
             unreachable!("unmatched response to a block header request")
         };
