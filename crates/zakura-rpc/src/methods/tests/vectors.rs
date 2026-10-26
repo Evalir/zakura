@@ -1634,6 +1634,8 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
 /// commitment trees. Thus a pruned node must give the same treestate as an archive node. A
 /// wallet server asks for the treestate at the wallet birthday. This height is usually much
 /// lower than the prune height.
+///
+/// In this test, the checkpoint commits do not keep the bodies of the old blocks.
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_z_get_treestate_serves_pruned_heights() {
     let _init_guard = zakura_test::init();
@@ -1658,30 +1660,82 @@ async fn rpc_z_get_treestate_serves_pruned_heights() {
         .collect();
     let tip_height = Height(u32::try_from(blocks.len() - 1).expect("test chain fits in a u32"));
 
-    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    // In pruned mode, a checkpoint commit does not keep the bodies of blocks below
+    // `max_checkpoint_height - tx_retention + 1`. This value puts that height at the test chain
+    // tip.
+    let max_checkpoint_height =
+        Height(zakura_state::PruningConfig::default().tx_retention + tip_height.0 - 1);
+    let (pruned_read_state, pruned_tip) =
+        pruned_state(&network, &blocks, max_checkpoint_height).await;
 
-    // Create an archive state service.
-    let (_, archive_read_state, archive_tip, _) =
-        zakura_state::populated_state(blocks.clone(), &network).await;
+    assert_pruned_node_serves_archive_treestates(&network, &blocks, pruned_read_state, pruned_tip)
+        .await;
+}
 
-    // Create a pruned state service. In pruned mode, a checkpoint commit does not keep the
-    // bodies of blocks below `max_checkpoint_height - tx_retention + 1`. This value puts that
-    // height at the test chain tip.
-    let pruning = zakura_state::PruningConfig::default();
-    let max_checkpoint_height = Height(pruning.tx_retention + tip_height.0 - 1);
+/// A pruned node must serve the Orchard treestate below its prune height.
+///
+/// In this test, the node first keeps all the block bodies. Then the pruning batch deletes them.
+/// Online pruning and offline pruning write the same batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_serves_pruned_orchard_heights() {
+    let _init_guard = zakura_test::init();
+
+    // NU5 activates below the tip of this chain, and the blocks after NU5 have Orchard note
+    // commitments.
+    let chain = zakura_state::VctFastSyncedChain::generate();
+    let network = chain.network().clone();
+    let tip_height = chain.handoff_height();
+    let blocks: Vec<Arc<Block>> = (0..=tip_height.0)
+        .map(|height| chain.block(Height(height)))
+        .collect();
+
+    // The tip is below the retention window. Thus the commits keep all the block bodies.
+    let (pruned_read_state, pruned_tip) = pruned_state(&network, &blocks, tip_height).await;
+
+    // Delete the bodies from height 1 to the height below the tip.
+    let db = pruned_read_state.db();
+    let mut batch = zakura_state::DiskWriteBatch::new();
+    batch.prepare_prune_batch(db, Height(1), tip_height);
+    db.write_batch(batch).expect("the pruning batch writes");
+
+    let treestates = assert_pruned_node_serves_archive_treestates(
+        &network,
+        &blocks,
+        pruned_read_state,
+        pruned_tip,
+    )
+    .await;
+
+    assert!(
+        treestates.iter().any(|treestate| treestate
+            .orchard()
+            .commitments()
+            .final_state()
+            .is_some()),
+        "the test chain must have Orchard trees below the prune height"
+    );
+}
+
+/// Commits `blocks` to a new state service in pruned storage mode.
+///
+/// Returns the read service and the chain tip of the new state.
+async fn pruned_state(
+    network: &Network,
+    blocks: &[Arc<Block>],
+    max_checkpoint_height: Height,
+) -> (ReadStateService, zakura_state::LatestChainTip) {
     let config = zakura_state::Config {
-        storage_mode: zakura_state::StorageMode::Pruned(pruning),
+        storage_mode: zakura_state::StorageMode::Pruned(zakura_state::PruningConfig::default()),
         ..zakura_state::Config::ephemeral()
     };
-    let (pruned_state, pruned_read_state, pruned_tip, _) =
-        zakura_state::init(config, &network, max_checkpoint_height, 0)
+    let (state, read_state, latest_chain_tip, _) =
+        zakura_state::init(config, network, max_checkpoint_height, 0)
             .await
             .expect("ephemeral state initialization succeeds");
-    let pruned_state = Buffer::new(pruned_state, 1);
+    let state = Buffer::new(state, 1);
 
-    for block in &blocks {
-        pruned_state
+    for block in blocks {
+        state
             .clone()
             .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
                 block.clone().into(),
@@ -1689,6 +1743,26 @@ async fn rpc_z_get_treestate_serves_pruned_heights() {
             .await
             .expect("test chain blocks are valid");
     }
+
+    (read_state, latest_chain_tip)
+}
+
+/// Makes sure that a pruned node gives the same treestates as an archive node with `blocks`.
+///
+/// The pruned node must not have the bodies from height 1 to the height below the tip. The
+/// function examines these heights by height and by hash, and returns the archive treestates.
+async fn assert_pruned_node_serves_archive_treestates(
+    network: &Network,
+    blocks: &[Arc<Block>],
+    pruned_read_state: ReadStateService,
+    pruned_tip: zakura_state::LatestChainTip,
+) -> Vec<GetTreestateResponse> {
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    // Create an archive state service.
+    let (_, archive_read_state, archive_tip, _) =
+        zakura_state::populated_state(blocks.to_vec(), network).await;
 
     // Make one RPC handler for each state service.
     let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -1708,6 +1782,8 @@ async fn rpc_z_get_treestate_serves_pruned_heights() {
         pruned_tip,
         rx,
     );
+
+    let mut treestates = Vec::new();
 
     // Genesis and the tip keep their bodies. Thus examine only the heights between them.
     for (i, block) in blocks.iter().enumerate().take(blocks.len() - 1).skip(1) {
@@ -1739,6 +1815,7 @@ async fn rpc_z_get_treestate_serves_pruned_heights() {
                 .expect("a pruned node keeps the treestate below the prune height");
 
             assert_eq!(treestate, expected_result);
+            treestates.push(expected_result);
         }
     }
 
@@ -1748,6 +1825,8 @@ async fn rpc_z_get_treestate_serves_pruned_heights() {
     // The queue tasks must continue to run without errors or panics.
     assert!(archive_rpc_tx_queue.now_or_never().is_none());
     assert!(pruned_rpc_tx_queue.now_or_never().is_none());
+
+    treestates
 }
 
 /// A `z_gettreestate` for a block that is not in the best chain must return `-8`.
